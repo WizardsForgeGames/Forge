@@ -31,7 +31,9 @@ TensorImpl* TensorImpl::create(Storage storage,
         p = tls_pool.back();
         tls_pool.pop_back();
     } else {
-        p = static_cast<TensorImpl*>(::operator new(sizeof(TensorImpl)));
+        // Construct the object (storage_ must be a valid null Storage before init()
+        // move-assigns into it, or the assignment releases a garbage pointer).
+        p = new (::operator new(sizeof(TensorImpl))) TensorImpl;
     }
     p->init(std::move(storage), storage_offset, dtype, ndim, sizes, strides);
     return p;
