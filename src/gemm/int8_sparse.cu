@@ -867,7 +867,16 @@ void sparse_int8_gemm(
 {
     if (M <= 0 || K <= 0 || N_out <= 0) return;
 
-    constexpr int SP_MAX_CTAS = 128;  // RTX 4090 has 128 SMs
+    // One persistent CTA per SM, queried from the current device (128 on an RTX 4090).
+    static int sm_count_cache[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int& sm_count = sm_count_cache[dev & 63];
+    if (sm_count == 0) {
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+        if (sm_count <= 0) sm_count = 128;
+    }
+    const int SP_MAX_CTAS = sm_count;
     constexpr int SP_SPLITK_TILE_THRESHOLD = 64;
     constexpr int SP_MAX_SPLIT_K = 32;
     constexpr int SP_MIN_K_PER_SPLIT = 4;
@@ -889,7 +898,8 @@ void sparse_int8_gemm(
     if (split_k <= 0) {
         split_k = 1;
         if (spatial_tiles < SP_SPLITK_TILE_THRESHOLD && k_iters_total >= 8) {
-            split_k = (SP_MAX_CTAS + spatial_tiles - 1) / spatial_tiles;
+            // Round down so spatial_tiles * split_k stays within one wave of CTAs.
+            split_k = SP_MAX_CTAS / spatial_tiles;
             const int max_by_k = k_iters_total / SP_MIN_K_PER_SPLIT;
             if (split_k > max_by_k) split_k = max_by_k;
             if (split_k > SP_MAX_SPLIT_K) split_k = SP_MAX_SPLIT_K;

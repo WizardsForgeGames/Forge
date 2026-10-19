@@ -20,8 +20,8 @@ __device__ __forceinline__ void cp_async_16(void* dst_smem, const void* src_gmem
     );
 }
 
-// Copy 16 bytes with L2 evict-first hint. Use for one-shot data (activations)
-// that won't be reloaded. Frees L2 capacity for weight tiles reused across M-waves.
+// Copy 16 bytes with cp.async.cg: cached in L2 only, bypassing L1 (no eviction-priority
+// hint). Use for streamed data (activations) that won't be re-read from L1.
 __device__ __forceinline__ void cp_async_16_stream(void* dst_smem, const void* src_gmem) {
     uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst_smem));
     asm volatile(
