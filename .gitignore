@@ -1,0 +1,43 @@
+# Build
+build/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiled
+*.o
+*.obj
+*.lib
+*.a
+*.so
+*.dll
+*.pyd
+*.exe
+
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# JetBrains
+.idea/
+
+# Profiling captures, build logs, scratch
+*.ncu-rep
+build_log*.txt
+nul
+*.zip
+
