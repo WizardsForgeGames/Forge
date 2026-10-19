@@ -93,13 +93,16 @@ void TensorImpl::init(Storage storage,
     if (ndim < kMaxDim)
         std::memset(strides_ + ndim, 0, (kMaxDim - ndim) * sizeof(int64_t));
 
+    // New tensors are leaves (not produced by autograd) and not views.
+    // Assign, don't OR: a heap-fresh TensorImpl has indeterminate flags_
+    // (the default constructor leaves it uninitialized), and a pooled one
+    // still carries the previous tensor's kIsView / cleared kIsLeaf.
+    flags_ = kIsLeaf;
+
     // Compute derived fields
     numel_ = compute_numel(sizes_, ndim);
     refresh_contiguity();
     refresh_data_ptr();
-
-    // New tensors are leaves (not produced by autograd)
-    flags_ |= kIsLeaf;
 }
 
 TensorImpl::~TensorImpl() {
