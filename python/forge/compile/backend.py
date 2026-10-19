@@ -1,9 +1,12 @@
 """Forge backend for torch.compile.
 
 Registers as a custom Dynamo backend that intercepts FX graphs, pattern-matches
-known subgraphs (Linear, Linear+Activation, Softmax+CE, Embedding), and replaces
-them with calls to Forge CUDA kernels. Unrecognized ops fall through to the
-default Inductor backend.
+nn.Linear / F.linear (and nn.Linear followed by ReLU/LeakyReLU), and replaces them
+with calls to Forge's FP32 GEMM. Everything else in the graph runs eagerly as
+ordinary PyTorch ops; this backend does not hand the rest of the graph to Inductor.
+
+Inference-only for now: the Forge GEMM call has no autograd formula, so gradients
+do not flow through rewritten Linear layers.
 """
 import torch
 import torch._dynamo

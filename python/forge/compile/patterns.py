@@ -4,9 +4,8 @@ Each pattern defines:
 1. A match condition (which FX nodes to look for)
 2. A replacement (what to insert instead)
 
-Patterns are applied greedily in priority order. Fused patterns
-(Linear+ReLU, GEMM+Softmax+CE) are checked before single-op patterns
-so we get maximum fusion.
+Patterns are applied greedily in priority order: Linear+ReLU/LeakyReLU is
+checked before the single-op Linear patterns.
 """
 import torch
 import torch.fx as fx
@@ -45,7 +44,10 @@ def _forge_fp32_linear(x: torch.Tensor, weight: torch.Tensor,
 def _forge_fp32_linear_relu(x: torch.Tensor, weight: torch.Tensor,
                             bias: torch.Tensor | None,
                             negative_slope: float = 0.0) -> torch.Tensor:
-    """Fused Linear + ReLU/LeakyReLU via Forge GEMM + elementwise."""
+    """Linear + ReLU/LeakyReLU as a Forge GEMM followed by an elementwise activation.
+
+    This is two kernel launches (GEMM, then activation), not a single fused kernel.
+    """
     out = _forge_fp32_linear(x, weight, bias)
     if negative_slope == 0.0:
         return F.relu(out)
@@ -61,7 +63,7 @@ def apply_forge_patterns(gm: fx.GraphModule) -> fx.GraphModule:
     """Walk the FX graph, find matching patterns, rewrite with Forge ops.
 
     Current patterns (in priority order):
-    1. nn.Linear + nn.ReLU/LeakyReLU -> fused linear+activation
+    1. nn.Linear + nn.ReLU/LeakyReLU -> Forge GEMM + activation (two kernels)
     2. nn.Linear -> Forge fp32_gemm
     3. F.linear -> Forge fp32_gemm
     """
@@ -69,7 +71,7 @@ def apply_forge_patterns(gm: fx.GraphModule) -> fx.GraphModule:
     modules = dict(gm.named_modules())
     replacements = 0
 
-    # Pattern 1: Linear followed by ReLU/LeakyReLU (fused)
+    # Pattern 1: Linear followed by ReLU/LeakyReLU
     for node in list(graph.nodes):
         if _is_relu_or_leaky(node, modules):
             linear_node = node.args[0] if isinstance(node.args[0], fx.Node) else None
