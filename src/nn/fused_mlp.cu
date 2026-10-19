@@ -1290,23 +1290,30 @@ fused_mlp_backward_tc_kernel(
                 // Store dW tile to global memory
                 // dW is [hidden, in_dim] packed contiguously. Tile (mt, nt) covers
                 // rows [mt*16..+16], cols [nt*16..+16].
-                // Use a staging buffer in s_W (which we're done with).
+                // Stage through s_W (done with it for this layer). Each warp
+                // needs its OWN 16x16 slot: the warps run concurrently, so a
+                // shared slot lets one warp's store overwrite another's tile
+                // before it is read back. Capacity: s_W holds hidden*w_stride
+                // >= hidden^2 floats = (hidden/16)^2 slots, and a warp only
+                // reaches this point if warp_id < total_tiles_dw = (hidden/16)^2.
+                float* s_stage = s_W + warp_id * (WM * WN);
                 wmma::store_matrix_sync(
-                    &s_W[0], acc, WN, wmma::mem_row_major);
+                    s_stage, acc, WN, wmma::mem_row_major);
+                __syncwarp();
 
-                // Write from staging to global with atomicAdd or scratch
+                // Write from staging to global with atomicAdd or scratch.
+                // 32 lanes cover 2 rows of 16 per step.
                 int warp_lane = tid % 32;
-                for (int r = 0; r < WM; r++) {
-                    for (int c = warp_lane; c < WN; c += 32) {
-                        int gj = mt * WM + r;
-                        int gk = nt * WN + c;
-                        float val = s_W[r * WN + c];
-                        if (use_scratch)
-                            dW_ptr[gj * in_dim + gk] += val;
-                        else
-                            atomicAdd(&dW_ptr[gj * in_dim + gk], val);
-                    }
+                for (int e = warp_lane; e < WM * WN; e += 32) {
+                    int gj = mt * WM + e / WN;
+                    int gk = nt * WN + e % WN;
+                    float val = s_stage[e];
+                    if (use_scratch)
+                        dW_ptr[gj * in_dim + gk] += val;
+                    else
+                        atomicAdd(&dW_ptr[gj * in_dim + gk], val);
                 }
+                __syncwarp();  // slot reads done before this warp's next store
             }
             __syncthreads();
         } else {
