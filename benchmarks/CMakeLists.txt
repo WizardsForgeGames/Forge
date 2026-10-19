@@ -6,4 +6,4 @@ function(forge_add_bench BENCH_NAME BENCH_SOURCE)
     )
 endfunction()
 
-# Benchmarks will be added in Phase 7.
+# No benchmarks are published yet; add them with forge_add_bench(<name> <source>).

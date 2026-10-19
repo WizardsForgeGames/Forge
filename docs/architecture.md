@@ -188,14 +188,18 @@ Entire multi-layer perceptron in a single CUDA kernel per pass. Activations flow
 | Kernel | Grid | Block | Shared Memory |
 |--------|------|-------|---------------|
 | `fused_mlp_forward_kernel` | `divup(B, 32)` | 32 (1 warp) | `s_W[H][w_stride] + s_bias[H] + s_act[32][a_stride]` |
-| `fused_mlp_backward_kernel` | `divup(B, 32)` | 128 (4 warps) | `s_W + s_bias + s_dact + s_act_in` |
+| `fused_mlp_backward_kernel` | `divup(B, 32)` | 32 (1 warp) | `s_W + s_bias + s_dact + s_act_in` |
+| multi-warp forward / backward variants | persistent grid-stride over 32-sample tiles | 256 (8 warps) | as above |
+| `reduce_block_grads_kernel` | over weights | — | reduces per-block gradient scratch |
 
 **Key optimizations:**
 - Bank-conflict avoidance: stride = cols + 1
 - Weights loaded layer-by-layer into smem (cooperative)
-- Multi-warp backward (BWD_BLOCK=128) for latency hiding
+- Multi-warp (8-warp, 256-thread) forward and backward variants for latency hiding
 - Flat inner-loop accumulation beats `__shfl_down` by 3x for smem-resident data
-- `atomicAdd` for weight gradient accumulation across batch tiles
+- Weight gradients: each block accumulates into its own scratch slice (no atomics), then
+  `reduce_block_grads_kernel` sums the slices; without scratch, a persistent grid-stride loop
+  falls back to `atomicAdd` with far fewer contending blocks
 - `cudaFuncSetAttribute` for extended smem when H ≥ 96
 
 ### Linear (`nn/linear`)
