@@ -11,6 +11,7 @@
 #include "forge/reduction_ops.h"
 #include "forge/comparison_ops.h"
 #include "forge/nn/conv2d.cuh"
+#include "forge/stream.h"
 
 #include <cstdio>
 #include <vector>
@@ -565,30 +566,36 @@ public:
         int W_out = (W_ + 2 * padW_ - dilW_ * (kW_ - 1) - 1) / strideW_ + 1;
         int N = static_cast<int>(grad_output.size(0));
 
-        // d_input
-        Tensor d_input = Tensor::zeros({N, C_in_, H_, W_});
+        // grad_output and the gradient buffers live on Forge's current
+        // (non-blocking) stream; run the conv kernels there too. On the
+        // legacy default stream they raced the producer of grad_output and
+        // the zeroing memsets, and came back all zeros.
+        cudaStream_t stream = getCurrentStream();
+        Tensor go = grad_output.contiguous();
+
+        // d_input (conv2d_backward_data zeroes it before accumulating)
+        Tensor d_input = Tensor::empty({N, C_in_, H_, W_}, DType::Float32, stream);
         nn::conv2d_backward_data(
-            grad_output.data<float>(), saved_weight_.data<float>(),
+            go.data<float>(), saved_weight_.data<float>(),
             d_input.data<float>(),
             N, C_in_, H_, W_, C_out_, kH_, kW_,
-            padH_, padW_, strideH_, strideW_, dilH_, dilW_, groups_);
+            padH_, padW_, strideH_, strideW_, dilH_, dilW_, groups_, stream);
 
-        // d_weight
+        // d_weight (beta = 0 overwrites; bias kernel writes every entry)
         int C_in_per_group = C_in_ / groups_;
-        Tensor d_weight = Tensor::zeros({C_out_, C_in_per_group, kH_, kW_});
+        Tensor d_weight = Tensor::empty({C_out_, C_in_per_group, kH_, kW_},
+                                        DType::Float32, stream);
         float* d_bias_ptr = nullptr;
         Tensor d_bias;
         if (has_bias_) {
-            d_bias = Tensor::zeros({C_out_});
+            d_bias = Tensor::empty({C_out_}, DType::Float32, stream);
             d_bias_ptr = d_bias.data<float>();
         }
         nn::conv2d_backward_weight(
-            grad_output.data<float>(), saved_input_.data<float>(),
+            go.data<float>(), saved_input_.data<float>(),
             d_weight.data<float>(), d_bias_ptr,
             N, C_in_, H_, W_, C_out_, kH_, kW_,
-            padH_, padW_, strideH_, strideW_, dilH_, dilW_, groups_, 0.0f);
-
-        cudaDeviceSynchronize();
+            padH_, padW_, strideH_, strideW_, dilH_, dilW_, groups_, 0.0f, stream);
 
         if (has_bias_) {
             return { d_input, d_weight, d_bias };

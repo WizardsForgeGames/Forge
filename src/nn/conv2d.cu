@@ -13,6 +13,7 @@
 #include <forge/gemm/fp32_tiled.cuh>
 #include <forge/autograd.h>
 #include <forge/error.h>
+#include <forge/stream.h>
 
 namespace forge { namespace nn {
 
@@ -359,7 +360,12 @@ Tensor conv2d(const Tensor& input, const Tensor& weight, const Tensor& bias,
     int H_out = conv_out_dim(H, padH, dilH, kH, strideH);
     int W_out = conv_out_dim(W, padW, dilW, kW, strideW);
 
-    Tensor output = Tensor::zeros({N, C_out, H_out, W_out});
+    // Tensors are allocated and produced on Forge's current stream, which is
+    // non-blocking: it does not order against the legacy default stream. The
+    // kernels must run on that same stream, or they race the producers of
+    // their inputs (and Tensor::zeros' memset of their outputs).
+    cudaStream_t stream = getCurrentStream();
+    Tensor output = Tensor::empty({N, C_out, H_out, W_out}, DType::Float32, stream);
 
     bool has_bias = bias.defined();
     nn::conv2d_forward(
@@ -367,9 +373,7 @@ Tensor conv2d(const Tensor& input, const Tensor& weight, const Tensor& bias,
         has_bias ? bias.data<float>() : nullptr,
         output.data<float>(),
         N, C_in, H, W, C_out, kH, kW,
-        padH, padW, strideH, strideW, dilH, dilW, groups);
-
-    cudaDeviceSynchronize();
+        padH, padW, strideH, strideW, dilH, dilW, groups, stream);
 
     if (should_record(input, weight) || (has_bias && should_record(bias))) {
         record_conv2d(output, input, weight, bias,

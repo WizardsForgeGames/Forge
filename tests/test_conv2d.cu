@@ -457,6 +457,61 @@ int main() {
         else failures++;
     }
 
+    // ================================================================
+    // Stream ordering: conv2d consumes a tensor produced on Forge's
+    // current stream, with no host sync in between. The forward and
+    // backward kernels must run on that stream, not the legacy default
+    // stream (which a non-blocking stream does not order against).
+    // ================================================================
+    for (int rep = 0; rep < 3; ++rep) {  // later reps run with warm allocator pools
+        const int N = 8, C_in = 32, H = 64, W = 64, C_out = 32;
+        std::vector<float> h_in((size_t)N * C_in * H * W), h_w((size_t)C_out * C_in * 9);
+        test::fill_random(h_in, -1.0f, 1.0f, 200);
+        test::fill_random(h_w, -0.2f, 0.2f, 201);
+        float* d_in = test::to_device(h_in);
+        float* d_w  = test::to_device(h_w);
+        Tensor x0 = Tensor::from_ptr(d_in, {N, C_in, H, W});
+        Tensor weight = Tensor::from_ptr(d_w, {C_out, C_in, 3, 3});
+        weight.set_requires_grad_(true);
+
+        // Producers on the Forge stream, immediately followed by conv2d.
+        Tensor x = mul(add(x0, 1.0f), 2.0f);       // x = 2 * (x0 + 1)
+        x.set_requires_grad_(true);
+        Tensor y = conv2d(x, weight, 1, 1, 1, 1);
+        Tensor loss = sum(mul(y, 3.0f));           // d_output = 3
+        backward(loss);
+        FORGE_CHECK(cudaDeviceSynchronize());
+
+        std::vector<float> hx(h_in.size());
+        for (size_t i = 0; i < hx.size(); ++i) hx[i] = 2.0f * (h_in[i] + 1.0f);
+        std::vector<float> ref_y((size_t)N * C_out * H * W), ref_dx(hx.size()), ref_dw(h_w.size());
+        std::vector<float> dout(ref_y.size(), 3.0f);
+        conv2d_fwd_cpu(hx.data(), h_w.data(), nullptr, ref_y.data(),
+                       N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1);
+        conv2d_bwd_data_cpu(dout.data(), h_w.data(), ref_dx.data(),
+                            N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1);
+        conv2d_bwd_weight_cpu(dout.data(), hx.data(), ref_dw.data(), nullptr,
+                              N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, 0.0f);
+
+        bool ok = x.grad().defined() && weight.grad().defined();
+        if (ok) {
+            auto gy  = test::to_host(y.data<float>(), y.numel());
+            auto gdx = test::to_host(x.grad().data<float>(), x.numel());
+            auto gdw = test::to_host(weight.grad().data<float>(), weight.numel());
+            // dW sums N*H*W = 32768 products of magnitude ~12: allow FP32
+            // accumulation-order error on |dW| up to ~1e3.
+            ok &= test::check_arrays(gy,  ref_y,  1e-3f, 1e-3f, "conv2d_stream_fwd");
+            ok &= test::check_arrays(gdx, ref_dx, 1e-3f, 1e-3f, "conv2d_stream_dinput");
+            ok &= test::check_arrays(gdw, ref_dw, 1e-1f, 1e-3f, "conv2d_stream_dweight");
+        } else {
+            std::fprintf(stderr, "FAIL [conv2d_stream]: missing gradients\n");
+        }
+        if (!ok) failures++;
+        y = Tensor(); loss = Tensor(); x = Tensor(); weight = Tensor(); x0 = Tensor();
+        test::free_device(d_in);
+        test::free_device(d_w);
+    }
+
     if (failures > 0) {
         std::printf("FAILED (%d failures)\n", failures);
         return 1;
