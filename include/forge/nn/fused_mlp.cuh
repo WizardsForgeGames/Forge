@@ -43,16 +43,19 @@ enum class Activation { CELU, GELU, ReLU, Sigmoid, SiLU, Tanh };
 
 /// Descriptor for a fused MLP architecture.
 /// Fill once, pass to forward/backward.
+///
+/// Every field has a default, so `MlpDesc desc;` followed by assignments is
+/// safe: an unset `use_tf32` means the FP32 path, never stack garbage.
 struct MlpDesc {
-    int        n_inputs;       // input dimension  (e.g. 9)
-    int        n_outputs;      // output dimension (e.g. 2)
-    int        hidden;         // hidden width     (e.g. 64)
-    int        n_layers;       // number of hidden layers (e.g. 5)
-    Activation act;            // activation function for hidden layers
-    float      act_param;      // activation parameter (alpha for CELU, slope for LeakyReLU)
-    float      output_scale;   // scale applied to final output (e.g. 0.01 for /100)
-    bool       normalize;      // apply min-max normalization to inputs
-    bool       use_tf32;       // use TF32 Tensor Cores (sm_80+, hidden % 16 == 0)
+    int        n_inputs     = 0;      // input dimension  (e.g. 9)
+    int        n_outputs    = 0;      // output dimension (e.g. 2)
+    int        hidden       = 0;      // hidden width     (e.g. 64, max 256)
+    int        n_layers     = 0;      // number of hidden layers (e.g. 5)
+    Activation act          = Activation::CELU;  // activation for hidden layers
+    float      act_param    = 1.0f;   // activation parameter (alpha for CELU)
+    float      output_scale = 1.0f;   // scale applied to final output (e.g. 0.01 for /100)
+    bool       normalize    = false;  // apply min-max normalization to inputs
+    bool       use_tf32     = false;  // use TF32 Tensor Cores (sm_80+, hidden % 16 == 0)
 };
 
 /// Returns total number of floats in the packed weight buffer.
