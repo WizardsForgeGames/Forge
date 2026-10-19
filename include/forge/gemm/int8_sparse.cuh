@@ -17,7 +17,9 @@
 #include <cstdint>
 
 // Version 2: cost-model dispatch, sparse_int8_gemm_plan, forced tile configs.
-#define FORGE_SPARSE_GEMM_API_VERSION 2
+// Version 3: fused quantize + GEMM path for sparse_int8_linear (path argument,
+//            sparse_int8_linear_fused).
+#define FORGE_SPARSE_GEMM_API_VERSION 3
 
 namespace forge { namespace gemm {
 
@@ -68,7 +70,23 @@ void sparse_int8_gemm(
     cudaStream_t    stream  = nullptr,
     int             tile    = kSparseTileAuto);
 
+/// sparse_int8_linear paths.
+constexpr int kSparseLinearAuto    = -1;  // fused when it saves DRAM traffic (see below)
+constexpr int kSparseLinearTwoPass = 0;   // quantize kernel -> int8 scratch -> sparse GEMM
+constexpr int kSparseLinearFused   = 1;   // one kernel: quantize into smem + sparse GEMM
+
+/// Whether sparse_int8_linear's automatic path fuses the activation quantize into the GEMM
+/// for this shape: K <= 1280 (the 64-token int8 block stays resident in shared memory),
+/// the activation and its int8 copy do not fit L2 (3*M*K > 0.9 * L2), and the DRAM traffic
+/// saved outweighs the smaller tile (cost model). Typical: narrow N_out at large M
+/// (1280 -> 320 at M = 147456: 1.51 ms -> 0.70 ms on an RTX 4090).
+bool sparse_int8_linear_fused(int M, int K, int N_out);
+
 /// Convenience: quant + sparse GEMM + dequant.
+/// path = kSparseLinearAuto picks the fused kernel when sparse_int8_linear_fused(M, K, N_out)
+/// and split_k <= 1; it then does not touch the scratch buffers or the workspace.
+/// kSparseLinearFused forces it (needs K <= 1280 and a 16-byte aligned x, else two-pass).
+/// Outputs are bit-identical across paths.
 void sparse_int8_linear(
     const __half*   x,           // (M, K) fp16 device
     const int8_t*   W_comp,      // (N_out, K/2) int8 device
@@ -83,7 +101,8 @@ void sparse_int8_linear(
     float*          scratch_x_scale,
     float*          splitk_workspace = nullptr,
     int             split_k = 1,
-    cudaStream_t    stream  = nullptr);
+    cudaStream_t    stream  = nullptr,
+    int             path    = kSparseLinearAuto);
 
 /// Split-K reduce: sum fp32 workspace partials -> fp16 output + bias.
 void splitk_reduce(

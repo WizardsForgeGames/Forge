@@ -15,6 +15,11 @@
 //
 // Usage: bench_int8_sparse [--rounds R] [--csv]
 //   --csv prints one machine-readable line per (shape, M): K,N,M,gemm_ms,quant_ms,tile,split
+//
+// API version >= 3 adds a second table: the full layer (sparse_int8_linear, fp16 in) at
+// narrow-N, large-M shapes (paint-UNet 1280->320 at 147456 tokens and relatives), two-pass
+// (quantize kernel + GEMM) vs fused quantize + GEMM vs the automatic path. These inputs
+// exceed L2, so they stream from DRAM as in a real network.
 #include <forge/gemm/int8_sparse.cuh>
 #include <forge/quant/quantize.cuh>
 #include <forge/sparsity/prune_compress.cuh>
@@ -225,6 +230,67 @@ int main(int argc, char** argv) {
         cudaFree(d_ws_scale); cudaFree(d_bias); cudaFree(d_xh); cudaFree(d_xq); cudaFree(d_xs);
         cudaFree(d_out); cudaFree(d_split_ws);
     }
+#if defined(FORGE_SPARSE_GEMM_API_VERSION) && FORGE_SPARSE_GEMM_API_VERSION >= 3
+    // Full layer at narrow-N, large-M shapes: two-pass vs fused vs auto.
+    const int lshapes[][3] = {{1280, 320, 147456}, {640, 320, 147456}, {640, 640, 36864},
+                              {1024, 640, 37008},  {1024, 320, 37008}, {1280, 1280, 9216}};
+    if (!csv)
+        std::printf("\n%11s %6s | %10s | %10s | %10s | %s\n", "K x N", "M", "two-pass",
+                    "fused", "auto", "auto path");
+    for (const auto& s : lshapes) {
+        const int K = s[0], N = s[1], M = s[2];
+        std::vector<int8_t> hw((size_t)N * K);
+        for (auto& v : hw) v = (int8_t)di8(rng);
+        int8_t* d_w = upload(hw);
+        int8_t* d_comp;  uint8_t* d_meta_raw;  uint32_t* d_meta;
+        CK(cudaMalloc(&d_comp, (size_t)N * K / 2));
+        CK(cudaMalloc(&d_meta_raw, (size_t)N * K / 4));
+        CK(cudaMalloc(&d_meta, (size_t)N * K / 32 * sizeof(uint32_t)));
+        forge::sparsity::prune_compress_24(d_w, d_comp, d_meta_raw, N, K);
+        forge::sparsity::pack_metadata(d_meta_raw, d_meta, N, K);
+        std::vector<__half> hws(N), hb(N);
+        for (int i = 0; i < N; i++) {
+            hws[i] = __float2half(0.001f + 0.01f * du(rng));
+            hb[i]  = __float2half(du(rng) - 0.5f);
+        }
+        __half* d_ws_scale = upload(hws);
+        __half* d_bias = upload(hb);
+        std::vector<__half> hx((size_t)M * K);
+        uint32_t lcg = 12345u;   // fast fill: uniform in [-2, 2)
+        for (auto& v : hx) { lcg = lcg * 1664525u + 1013904223u; v = __float2half((lcg >> 8) * (4.0f / 16777216.0f) - 2.0f); }
+        __half* d_xh = upload(hx);
+        int8_t* d_xq;  float* d_xs;  __half* d_out;
+        CK(cudaMalloc(&d_xq, (size_t)M * K));
+        CK(cudaMalloc(&d_xs, (size_t)M * sizeof(float)));
+        CK(cudaMalloc(&d_out, (size_t)M * N * sizeof(__half)));
+        auto layer = [&](int path) {
+            return [&, path](cudaStream_t s) {
+                forge::gemm::sparse_int8_linear(d_xh, d_comp, d_meta, d_ws_scale, d_bias, d_out,
+                                                M, K, N, d_xq, d_xs, nullptr, 1, s, path);
+            };
+        };
+        std::vector<float> t2, tf, ta;
+        for (int r = 0; r < rounds; r++) {
+            t2.push_back(time_graph(layer(forge::gemm::kSparseLinearTwoPass), st));
+            tf.push_back(time_graph(layer(forge::gemm::kSparseLinearFused), st));
+            ta.push_back(time_graph(layer(forge::gemm::kSparseLinearAuto), st));
+        }
+        for (auto* v : {&t2, &tf, &ta}) std::sort(v->begin(), v->end());
+        const bool fused = forge::gemm::sparse_int8_linear_fused(M, K, N);
+        CK(cudaGetLastError());
+        if (csv)
+            std::printf("layer,%d,%d,%d,%.5f,%.5f,%.5f,%d\n", K, N, M, t2[t2.size() / 2],
+                        tf[tf.size() / 2], ta[ta.size() / 2], fused ? 1 : 0);
+        else
+            std::printf("%5dx%-5d %6d | %8.4fms | %8.4fms | %8.4fms | %s\n", K, N, M,
+                        t2[t2.size() / 2], tf[tf.size() / 2], ta[ta.size() / 2],
+                        fused ? "fused" : "two-pass");
+        std::fflush(stdout);
+        cudaFree(d_w); cudaFree(d_comp); cudaFree(d_meta_raw); cudaFree(d_meta);
+        cudaFree(d_ws_scale); cudaFree(d_bias); cudaFree(d_xh); cudaFree(d_xq); cudaFree(d_xs);
+        cudaFree(d_out);
+    }
+#endif
     CK(cudaStreamDestroy(st));
     return 0;
 }

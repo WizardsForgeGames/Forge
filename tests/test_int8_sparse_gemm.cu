@@ -7,7 +7,11 @@
 // 64 steps), for every tile config x split-K factor the dispatcher can run (forced), plus
 // the automatic plan with and without a split-K workspace. The reference is an FP64 GEMM
 // of the CPU-pruned dense weights (2:4, two largest magnitudes kept per group of 4).
+// sparse_int8_linear (fp16 in): the fused quantize + GEMM path must match the two-pass path
+// bit for bit, including at a large-M narrow-N shape where the automatic path fuses and the
+// two-pass GEMM walks tiles N-fastest (int8 activation larger than L2).
 #include <forge/gemm/int8_sparse.cuh>
+#include <forge/quant/quantize.cuh>
 #include <forge/sparsity/prune_compress.cuh>
 #include <forge/sparsity/pack_metadata.cuh>
 #include "test_helpers.cuh"
@@ -163,6 +167,108 @@ static int run_shape(const Shape& sh, uint64_t seed) {
     return failures;
 }
 
+// sparse_int8_linear: fused vs two-pass (bit-identical), auto path, and a sampled FP64
+// reference (rows checked against quantize -> pruned-weight GEMM on the CPU).
+static int run_linear(const Shape& sh, uint64_t seed, bool expect_fused) {
+    const int M = sh.M, K = sh.K, N = sh.N;
+    const bool fused_auto = gemm::sparse_int8_linear_fused(M, K, N);
+    std::printf("  linear M=%d K=%d N=%d (auto path: %s)\n", M, K, N, fused_auto ? "fused" : "two-pass");
+    int failures = 0;
+    if (fused_auto != expect_fused) {
+        std::fprintf(stderr, "FAIL: auto path %d, expected %d\n", (int)fused_auto, (int)expect_fused);
+        failures++;
+    }
+
+    std::vector<int8_t> h_weight((size_t)N * K);
+    test::fill_random_int8(h_weight, seed);
+    std::vector<float> h_xf((size_t)M * K), h_w_scale_f(N), h_bias_f(N);
+    test::fill_random(h_xf, -2.0f, 2.0f, seed + 1);
+    test::fill_random(h_w_scale_f, 0.001f, 0.05f, seed + 3);
+    test::fill_random(h_bias_f, -0.5f, 0.5f, seed + 4);
+    std::vector<__half> h_x((size_t)M * K), h_w_scale(N), h_bias(N);
+    for (size_t i = 0; i < h_x.size(); i++) h_x[i] = __float2half(h_xf[i]);
+    for (int i = 0; i < N; i++) {
+        h_w_scale[i] = __float2half(h_w_scale_f[i]);
+        h_bias[i]    = __float2half(h_bias_f[i]);
+    }
+
+    int8_t*   d_weight = test::to_device(h_weight);
+    int8_t*   d_comp   = test::to_device_zeroed<int8_t>((size_t)N * K / 2);
+    uint8_t*  d_meta_raw    = test::to_device_zeroed<uint8_t>((size_t)N * K / 4);
+    uint32_t* d_meta_packed = test::to_device_zeroed<uint32_t>((size_t)N * K / 32);
+    sparsity::prune_compress_24(d_weight, d_comp, d_meta_raw, N, K);
+    sparsity::pack_metadata(d_meta_raw, d_meta_packed, N, K);
+    __half* d_x       = test::to_device(h_x);
+    __half* d_w_scale = test::to_device(h_w_scale);
+    __half* d_bias    = test::to_device(h_bias);
+    int8_t* d_xq      = test::to_device_zeroed<int8_t>((size_t)M * K);
+    float*  d_xs      = test::to_device_zeroed<float>((size_t)M);
+    __half* d_out_two = test::to_device_zeroed<__half>((size_t)M * N);
+    __half* d_out_fq  = test::to_device_zeroed<__half>((size_t)M * N);
+    __half* d_out_au  = test::to_device_zeroed<__half>((size_t)M * N);
+
+    FORGE_CHECK(cudaMemset(d_out_fq, 0x7B, (size_t)M * N * sizeof(__half)));
+    gemm::sparse_int8_linear(d_x, d_comp, d_meta_packed, d_w_scale, d_bias, d_out_two, M, K, N,
+                             d_xq, d_xs, nullptr, 1, nullptr, gemm::kSparseLinearTwoPass);
+    gemm::sparse_int8_linear(d_x, d_comp, d_meta_packed, d_w_scale, d_bias, d_out_fq, M, K, N,
+                             nullptr, nullptr, nullptr, 1, nullptr, gemm::kSparseLinearFused);
+    gemm::sparse_int8_linear(d_x, d_comp, d_meta_packed, d_w_scale, d_bias, d_out_au, M, K, N,
+                             d_xq, d_xs, nullptr, 0, nullptr);
+    FORGE_CHECK(cudaGetLastError());
+    FORGE_CHECK(cudaDeviceSynchronize());
+    const auto two = test::to_host(d_out_two, (size_t)M * N);
+    const auto fq  = test::to_host(d_out_fq, (size_t)M * N);
+    const auto au  = test::to_host(d_out_au, (size_t)M * N);
+    size_t diff_fq = 0, diff_au = 0;
+    for (size_t i = 0; i < two.size(); i++) {
+        const uint16_t a = reinterpret_cast<const uint16_t&>(two[i]);
+        diff_fq += (reinterpret_cast<const uint16_t&>(fq[i]) != a);
+        diff_au += (reinterpret_cast<const uint16_t&>(au[i]) != a);
+    }
+    std::printf("    fused vs two-pass: %zu/%zu differ, auto vs two-pass: %zu differ\n",
+                diff_fq, two.size(), diff_au);
+    if (diff_fq || diff_au) { std::fprintf(stderr, "FAIL: paths not bit-identical\n"); failures++; }
+
+    // Sampled FP64 reference: rows quantized on the CPU like the kernel (absmax / 127, round
+    // to nearest even; the kernel's fast-math reciprocal can move a tie by one int8 step),
+    // times the CPU-pruned weights. Error normalized by the sampled outputs' RMS.
+    const std::vector<int8_t> w_pruned = prune_24_dense(h_weight, N, K);
+    const auto xs = test::to_host(d_xs, (size_t)M);
+    const int rows[] = {0, 1, M / 3, M / 2, M - 2, M - 1};
+    double max_err = 0.0, ref_ss = 0.0;
+    size_t n_ref = 0;
+    for (int m : rows) {
+        float amax = 0.f;
+        for (int k = 0; k < K; k++) amax = std::max(amax, std::fabs(__half2float(h_x[(size_t)m * K + k])));
+        const float scale = std::max(amax, 1e-8f) / 127.0f;
+        if (std::abs(scale - xs[m]) > 1e-6f * scale) {
+            std::fprintf(stderr, "FAIL: row %d scale %.8g vs %.8g\n", m, scale, xs[m]); failures++;
+        }
+        for (int n = 0; n < N; n++) {
+            long long acc = 0;
+            for (int k = 0; k < K; k++) {
+                const float v = __half2float(h_x[(size_t)m * K + k]) * (1.0f / scale);
+                const int q = std::max(-128, std::min(127, (int)std::nearbyint(v)));
+                acc += (long long)q * w_pruned[(size_t)n * K + k];
+            }
+            const double ref = (double)acc * scale * __half2float(h_w_scale[n]) + __half2float(h_bias[n]);
+            const double got = __half2float(fq[(size_t)m * N + n]);
+            max_err = std::max(max_err, std::abs(got - ref));
+            ref_ss += ref * ref;
+            n_ref++;
+        }
+    }
+    const double max_rel = max_err / std::sqrt(ref_ss / (double)n_ref);
+    std::printf("    sampled rows vs FP64: max err / rms %.3e %s\n", max_rel, max_rel < 5e-3 ? "ok" : "FAIL");
+    if (!(max_rel < 5e-3)) failures++;
+
+    test::free_device(d_weight); test::free_device(d_comp); test::free_device(d_meta_raw);
+    test::free_device(d_meta_packed); test::free_device(d_x); test::free_device(d_w_scale);
+    test::free_device(d_bias); test::free_device(d_xq); test::free_device(d_xs);
+    test::free_device(d_out_two); test::free_device(d_out_fq); test::free_device(d_out_au);
+    return failures;
+}
+
 int main() {
     std::printf("=== Test: INT8 Sparse GEMM ===\n");
     // Kernel requirements: K % 64 == 0, N % 16 == 0. M is unconstrained.
@@ -182,6 +288,16 @@ int main() {
         failures += run_shape(s, seed);
         seed += 10;
     }
+
+    // sparse_int8_linear: fused vs two-pass. The large shape (1280 -> 320, M = 70000: 269 MB
+    // of fp16 activation) takes the fused path automatically on a 72 MB-L2 RTX 4090 and its
+    // two-pass GEMM runs N-fastest; the small ones stay two-pass (ragged M / N, one K step).
+    int l2 = 0;
+    FORGE_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0));
+    failures += run_linear({70000, 1280, 320}, 900, 3.0 * 70000 * 1280 > 0.9 * l2);
+    failures += run_linear({5000, 1024, 336}, 910, false);
+    failures += run_linear({  37,  64,  16}, 920, false);
+    failures += run_linear({4096, 1280, 5120}, 930, false);   // headline: never fused
 
     // The dispatcher's choices at representative shapes (RTX 4090 cost model).
     std::printf("  auto plans (with workspace):\n");

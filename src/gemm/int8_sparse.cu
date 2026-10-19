@@ -14,6 +14,10 @@
 //   - one persistent CTA per SM (dynamic smem request > half the SM), 3 pipeline stages,
 //     M-fastest tile order
 //   - tile and split-K chosen by a wave-aware cost model
+// and the 2026-10-20 narrow-N follow-up (sparsemma, fused quantize):
+//   - N-fastest tile order when the int8 activation exceeds L2 (read once, not per column)
+//   - fused quantize + GEMM for K <= 1280 (resident int8 activation block, L2 prefetch of
+//     the next block), picked by sparse_int8_linear when it saves DRAM traffic
 //
 // The core template (sparse_gemm_impl) is kept identical to Sparsemma; only the PyTorch
 // wrapper layer has been replaced with a standalone C++ API.
@@ -49,14 +53,32 @@ constexpr int SP_THREADS  = SP_WARPS_WR * SP_WARPS_BC * 32;  // 256
 //                   is barrier/latency-bound rather than L2-bound.
 //   META_STEPS = 4: 32 bytes (4 K steps) per row into a 2-slot ring every 4th K step: full
 //                   sectors, ~25% less L2 traffic for the large, L2-bound tiles.
-template <int BW, int BC>
-constexpr int sp_meta_steps() { return (BC == 64) ? 1 : 4; }
+// FQ (fused quantize, see sp_fq_base_bytes) 128x64: 2-step chunks (16 B/row, 2 stages ahead
+// need META_STEPS >= 2); its K loop streams only weights, so metadata sectors matter more.
+template <int BW, int BC, bool FQ = false>
+constexpr int sp_meta_steps() { return (BC == 64) ? (FQ ? 2 : 1) : 4; }
 
 // Pipeline depth per tile (A+B per stage: 16 / 12 / 8 KB). 3 stages measured best for all
 // tiles: deeper pipelines enlarge the smem carve-out and shrink L1, and with one CTA per SM
 // and an L2-bound loop 3 stages already cover the latency.
 template <int BW, int BC>
 constexpr int sp_stages() { return 3; }
+
+// Fused-quantize (FQ) path layout: [A+metadata pipeline | epilogue staging] (the larger of
+// the two), then the resident int8 activation block (BC rows x full K, stored as K steps in
+// the pipeline's B-stage layout), then BC fp32 per-token scales.
+template <int BW, int BC>
+constexpr int sp_fq_base_bytes() {
+    constexpr int MS   = sp_meta_steps<BW, BC, true>();
+    constexpr int PIPE = sp_stages<BW, BC>() * (BW * SP_K_COMP + (MS == 1 ? BW * 8 : 0))
+                       + (MS == 1 ? 0 : 2 * BW * MS * 8);
+    constexpr int STG  = BC * BW * 2;
+    return PIPE > STG ? PIPE : STG;
+}
+// Register-staged row quantize: each lane holds FQ_VPT 16-byte vectors of a row
+// (K <= FQ_VPT * 256 = 1280).
+template <int BC>
+constexpr int sp_fq_vpt() { return 5; }
 
 template <int BW, int BC, int STAGES>
 constexpr int sp_smem_bytes() {
@@ -101,11 +123,20 @@ __global__ void splitk_reduce_kernel(
 //    BLOCK_WR_T: 128 or 256 weight rows per tile
 //    BLOCK_BC_T: 64 or 128 batch columns (tokens) per tile
 //    DB_STAGES_T: pipeline depth
-//  Persistent CTAs (one per SM) walk tiles in M-fastest order; tile shape and split-K
-//  come from the cost model in sparse_int8_gemm_plan.
+//  Persistent CTAs (one per SM) walk tiles in M-fastest order (N-fastest once the int8
+//  activation exceeds L2); tile shape and split-K come from the cost model in
+//  sparse_int8_gemm_plan.
+//
+//  FQ = true (sparse_gemm_fq_kernel, 128x64 only): fused activation quantize. B is not
+//  pipelined: each CTA quantizes its 64-token block (full K <= 1280) from fp16 into a
+//  resident smem block once, runs every weight tile against it (N-fastest), and
+//  prefetches its next block into L2 meanwhile. Removes the int8 activation's DRAM
+//  round trip on large-M, narrow-N layers (see sp_use_fused).
 // ===========================================================================
 
-template <int BLOCK_WR_T, int BLOCK_BC_T, int DB_STAGES_T>
+// NF: N-fastest tile order (FQ always; the two-kernel GEMM when the int8 activation
+// exceeds L2). A template parameter so the M-fastest kernels compile exactly as before.
+template <int BLOCK_WR_T, int BLOCK_BC_T, int DB_STAGES_T, bool FQ = false, bool NF = FQ>
 __device__ __forceinline__ void sparse_gemm_impl(
     const int8_t*   __restrict__ W_comp,     // (N_out, K/2) compressed weight
     const int8_t*   __restrict__ x_int8,     // (M, K) quantized activation
@@ -117,7 +148,9 @@ __device__ __forceinline__ void sparse_gemm_impl(
     float*          __restrict__ splitk_ws,  // split-K fp32 workspace, or nullptr
     const int M, const int K, const int N_out,
     const int split_k,             // 1 = normal, >1 = split-K mode
-    const int k_iters_per_split    // K iterations per split (ceiling)
+    const int k_iters_per_split,   // K iterations per split (ceiling)
+    const __half* __restrict__ x_fp16,  // FQ: (M, K) fp16 activation, quantized in-kernel
+    const int x_stream                  // FQ: evict-first loads of x_fp16 (input > L2)
 ) {
     // -- Derived constants from template parameters --
     constexpr int WARP_WR = BLOCK_WR_T / SP_WARPS_WR;       // 32 or 64
@@ -128,15 +161,20 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
     // Pipelined smem: DB_STAGES x (A_tile + B_tile), then a 2-slot metadata ring
     constexpr int SMEM_A_STAGE = BLOCK_WR_T * SP_K_COMP;             // 4096 or 8192
-    constexpr int SMEM_B_STAGE = BLOCK_BC_T * SP_BLOCK_K;            // 4096 or 8192
+    constexpr int SMEM_B_STAGE = FQ ? 0 : BLOCK_BC_T * SP_BLOCK_K;   // 4096 or 8192 (FQ: resident)
     // Sparsity metadata: see sp_meta_steps (per-stage slot, or a 2-slot 4-step ring)
-    constexpr int META_STEPS   = sp_meta_steps<BLOCK_WR_T, BLOCK_BC_T>();
+    constexpr int META_STEPS   = sp_meta_steps<BLOCK_WR_T, BLOCK_BC_T, FQ>();
+    // Ring slot swizzle: rows 16/META_STEPS apart share banks; XOR their 8-byte step slot
+    constexpr int MQ_SHIFT     = (META_STEPS == 2) ? 3 : 2;
     constexpr int SMEM_M_STAGE = (META_STEPS == 1) ? BLOCK_WR_T * 8 : 0;
     constexpr int SMEM_PER_STAGE = SMEM_A_STAGE + SMEM_B_STAGE + SMEM_M_STAGE;
     constexpr int SMEM_M_SLOT  = (META_STEPS == 1) ? 0 : BLOCK_WR_T * META_STEPS * 8;
     constexpr int SMEM_M_OFF   = DB_STAGES * SMEM_PER_STAGE;
     constexpr int SMEM_DB      = SMEM_M_OFF + 2 * SMEM_M_SLOT;
-    static_assert(SMEM_DB == sp_smem_bytes<BLOCK_WR_T, BLOCK_BC_T, DB_STAGES>(), "smem layout");
+    static_assert(FQ || SMEM_DB == sp_smem_bytes<BLOCK_WR_T, BLOCK_BC_T, DB_STAGES>(), "smem layout");
+    // FQ: resident activation block offset (after the pipeline / epilogue staging region)
+    constexpr int SMEM_FQ_B = FQ ? sp_fq_base_bytes<BLOCK_WR_T, BLOCK_BC_T>() : 0;
+    static_assert(!FQ || SMEM_FQ_B >= SMEM_DB, "FQ layout");
     static_assert(META_STEPS == 1 || META_STEPS >= DB_STAGES - 1,
                   "2-slot metadata ring needs META_STEPS >= DB_STAGES - 1");
 
@@ -164,7 +202,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
     const int spatial_tiles = tiles_x * tiles_y;
     const int total_tiles = spatial_tiles * split_k;
 
-    // -- Shared memory (persists across tile iterations; dynamic, > 48 KB for 256x128) --
+    // -- Shared memory (persists across tile iterations) --
+    // Dynamic smem allows > 48KB (needed for 4-stage 256x128 = 64KB)
     extern __shared__ int8_t smem_raw[];
 
     const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
@@ -178,6 +217,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
     const int tile_start = blockIdx.x * tiles_per_cta;
     const int tile_end   = min(tile_start + tiles_per_cta, total_tiles);
 
+    [[maybe_unused]] int res_m = -1;   // FQ: M-tile whose activation block is resident in smem
+
     for (int tile_id = tile_start; tile_id < tile_end; tile_id++) {
 
     // -- Decode tile_id -> (spatial_id, k_split_id) --
@@ -190,8 +231,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
     // M-fastest: consecutive tiles of a CTA (block-partitioned) share the weight tile,
     // and co-running CTAs mostly share weight rows. Measured faster than N-fastest and
     // than banded/grouped orders on the headline shapes.
-    const int tile_n = spatial_id / tiles_y;
-    const int tile_m = spatial_id % tiles_y;
+    // N-fastest (FQ always; two-kernel path when the int8 activation exceeds L2): the CTA
+    // runs every weight tile against one activation block before moving on, so the
+    // activation is read from DRAM once instead of once per weight-tile column.
+    const int tile_n = NF ? spatial_id % tiles_x : spatial_id / tiles_y;
+    const int tile_m = NF ? spatial_id / tiles_x : spatial_id % tiles_y;
 
     // -- K-range for this split --
     const int k_start_iter  = k_split_id * k_iters_per_split;
@@ -201,6 +245,94 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
     const int block_wr = tile_n * BLOCK_WR_T;
     const int block_bc = tile_m * BLOCK_BC_T;
+
+    // ================================================================
+    //  FQ: quantize this M-tile's activation rows into the resident smem block
+    //  (once per M-tile; consecutive tiles of a CTA share it, N-fastest order).
+    //  Each warp quantizes BLOCK_BC_T/8 rows, two at a time: a lane holds up to
+    //  FQ_VPT 16-byte vectors of each row in registers, the warp reduces the row
+    //  absmax with shuffles, then stores 8 int8 per vector in the B-stage layout of
+    //  K step k/64. Arithmetic matches _sp_quantize_vec_kernel (bit-identical).
+    //  The previous tile's trailing __syncthreads() protects the overwrite.
+    // ================================================================
+    if constexpr (FQ) {
+        if (tile_m != res_m) {
+            res_m = tile_m;
+            constexpr int FQ_VPT = sp_fq_vpt<BLOCK_BC_T>();
+            constexpr int ROWS_PER_WARP = BLOCK_BC_T / (SP_THREADS / 32);
+            const int nvec = K / 8;
+            float* s_scale = reinterpret_cast<float*>(smem_raw + SMEM_FQ_B + BLOCK_BC_T * K);
+            #pragma unroll 1
+            for (int rr = 0; rr < ROWS_PER_WARP; rr += 2) {
+                uint4 v[2][FQ_VPT];
+                float amax[2];
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    const int r = warp * ROWS_PER_WARP + rr + u;
+                    const uint4* src = reinterpret_cast<const uint4*>(
+                        x_fp16 + (size_t)min(block_bc + r, M - 1) * K);
+                    amax[u] = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < FQ_VPT; i++) {
+                        const int idx = lane + 32 * i;
+                        if (idx < nvec) {
+                            v[u][i] = x_stream ? __ldcs(src + idx) : src[idx];
+                            const __half2* h = reinterpret_cast<const __half2*>(&v[u][i]);
+                            #pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                const float2 f = __half22float2(h[j]);
+                                amax[u] = fmaxf(amax[u], fmaxf(fabsf(f.x), fabsf(f.y)));
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        amax[u] = fmaxf(amax[u], __shfl_xor_sync(0xffffffff, amax[u], o));
+                    const int r = warp * ROWS_PER_WARP + rr + u;
+                    const float scale = fmaxf(amax[u], 1e-8f) / 127.0f;
+                    const float inv_scale = 1.0f / scale;
+                    if (lane == 0) s_scale[r] = scale;
+                    #pragma unroll
+                    for (int i = 0; i < FQ_VPT; i++) {
+                        const int idx = lane + 32 * i;
+                        if (idx < nvec) {
+                            const __half2* h = reinterpret_cast<const __half2*>(&v[u][i]);
+                            uint32_t packed[2] = {0u, 0u};
+                            #pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                const float2 f = __half22float2(h[j]);
+                                const int q0 = max(-128, min(127, __float2int_rn(f.x * inv_scale)));
+                                const int q1 = max(-128, min(127, __float2int_rn(f.y * inv_scale)));
+                                packed[j >> 1] |= ((uint32_t)(q0 & 0xFF) << (16 * (j & 1)))
+                                                | ((uint32_t)(q1 & 0xFF) << (16 * (j & 1) + 8));
+                            }
+                            const int k = idx * 8;
+                            const uint32_t a = smem_base + SMEM_FQ_B
+                                + (uint32_t)((k / SP_BLOCK_K) * (BLOCK_BC_T * SP_BLOCK_K)
+                                             + r * SP_BLOCK_K + b_swiz(r, k % SP_BLOCK_K));
+                            asm volatile("st.shared.v2.u32 [%0], {%1, %2};\n"
+                                         :: "r"(a), "r"(packed[0]), "r"(packed[1]));
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            // Prefetch the CTA's next M-tile (contiguous rows of x) into L2 now, so its DRAM
+            // read overlaps this M-tile's K loops and its quantize phase above hits L2.
+            const int nm = tile_m + 1;
+            if (nm < tiles_y && nm * tiles_x < tile_end) {
+                const char* pf_base = reinterpret_cast<const char*>(x_fp16 + (size_t)nm * BLOCK_BC_T * K);
+                const int pf_lines = min(BLOCK_BC_T, M - nm * BLOCK_BC_T) * (K / 64);   // 128-byte lines
+                for (int l = t; l < pf_lines; l += SP_THREADS)
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(pf_base + (size_t)l * 128));
+                // Measured on 1280x320, M=147456: no prefetch 0.774 ms, this 0.689; issuing it
+                // before the quantize phase 0.793, two M-tiles ahead 0.779, evict_last 0.721.
+            }
+        }
+    }
 
     // -- Accumulators: TILES_M M-tiles x TILES_N N-tiles x 4 int32 --
     int32_t acc[TILES_M][TILES_N][4];
@@ -247,8 +379,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
         a_src[it] = W_comp + (size_t)min(block_wr + row, N_out - 1) * K_comp + col;
         a_dst[it] = row * SP_K_COMP + a_swiz(row, col);
     }
-    const int8_t* b_src[B_ITERS];
-    uint32_t      b_dst[B_ITERS];
+    [[maybe_unused]] const int8_t* b_src[B_ITERS];   // unused by FQ (B is resident)
+    [[maybe_unused]] uint32_t      b_dst[B_ITERS];
     #pragma unroll
     for (int it = 0; it < B_ITERS; it++) {
         const int row = t / B_CPR + it * (SP_THREADS / B_CPR);
@@ -273,7 +405,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
         m_src[it] = w_meta + (size_t)min(block_wr + row, N_out - 1) * meta_cols + 2 * m_j;
         m_dst[it] = (META_STEPS == 1)
             ? (uint32_t)(SMEM_A_STAGE + SMEM_B_STAGE + row * 8)            // stage-relative
-            : (uint32_t)(row * (META_STEPS * 8) + ((m_j ^ ((row >> 2) & 3)) << 3));
+            : (uint32_t)(row * (META_STEPS * 8)
+                         + ((m_j ^ ((row >> MQ_SHIFT) & (META_STEPS - 1))) << 3));
     }
 
     // Async load of absolute K step K_ABS into the stage at smem byte offset STAGE_OFF.
@@ -282,9 +415,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
         _Pragma("unroll")                                                          \
         for (int _it = 0; _it < A_ITERS; _it++)                                   \
             cp_async_16_u32(_so + a_dst[_it], a_src[_it] + (K_ABS) * SP_K_COMP);  \
-        _Pragma("unroll")                                                          \
-        for (int _it = 0; _it < B_ITERS; _it++)                                   \
-            cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
+        if constexpr (!FQ) {                                                       \
+            _Pragma("unroll")                                                      \
+            for (int _it = 0; _it < B_ITERS; _it++)                               \
+                cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
+        }                                                                          \
         if constexpr (META_STEPS == 1) {                                           \
             if (m_loader)                                                          \
                 cp_async_8_u32(_so + m_dst[0], m_src[0] + (K_ABS) * 2);            \
@@ -322,10 +457,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
     }();
     const uint32_t b_ldm_off = [&] {
         const int row = warp_bc + (lane & 7);
-        return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, (lane >> 3) << 4));
+        return (uint32_t)((FQ ? SMEM_FQ_B : SMEM_A_STAGE) + row * SP_BLOCK_K
+                          + b_swiz(row, (lane >> 3) << 4));
     }();
     const int      m_row     = warp_wr + groupID + ((tid & 1) << 3);
-    const int      m_q       = (m_row >> 2) & 3;
+    const int      m_q       = (m_row >> MQ_SHIFT) & (META_STEPS - 1);
     const uint32_t m_ldm_off = (META_STEPS == 1 ? SMEM_A_STAGE + SMEM_B_STAGE : SMEM_M_OFF)
                              + (uint32_t)(m_row * (META_STEPS * 8) + (tid >> 1) * 4);
 
@@ -360,6 +496,12 @@ __device__ __forceinline__ void sparse_gemm_impl(
             LOAD_TILE(ahead_off, k_start_iter + k_ahead);
 
         const uint32_t cur = smem_base + comp_off;
+        // B fragments: the current pipeline stage, or (FQ) K step k of the resident block
+        const uint32_t bcur = FQ ? smem_base + (uint32_t)((k_start_iter + ki) * (BLOCK_BC_T * SP_BLOCK_K))
+                                 : cur;
+
+        // FQ: warps whose weight rows are all past N_out (narrow N, last tile) skip the math
+        if (!FQ || block_wr + warp_wr < N_out) {
 
         // -- Metadata from the shared-memory ring (staged by LOAD_TILE) --
         // One conflict-free LDS per M-tile.
@@ -399,7 +541,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
             asm volatile(
                 "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(b_frag0[0]), "=r"(b_frag0[1]), "=r"(b_frag1[0]), "=r"(b_frag1[1])
-                : "r"(cur + b_ldm_off + nj * 8 * SP_BLOCK_K)
+                : "r"(bcur + b_ldm_off + nj * 8 * SP_BLOCK_K)
             );
 
             #pragma unroll
@@ -427,6 +569,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
                 );
             }
         }
+        }   // warp-live
 
         // Rotate stage offsets
         comp_off  = (comp_off  + SMEM_PER_STAGE == DB_STAGES * SMEM_PER_STAGE) ? 0 : comp_off  + SMEM_PER_STAGE;
@@ -445,6 +588,13 @@ __device__ __forceinline__ void sparse_gemm_impl(
     //  No shared memory, so no extra CTA barrier before the next tile.
     // ================================================================
     {
+        // Per-token activation scale: global, or (FQ) the block's smem copy
+        auto act_sc = [&](int bc) -> float {
+            if constexpr (FQ)
+                return reinterpret_cast<const float*>(smem_raw + SMEM_FQ_B + BLOCK_BC_T * K)[bc - block_bc];
+            else
+                return act_scale[min(bc, M - 1)];
+        };
         float ws_r[TILES_M][2], bias_r[TILES_M][2];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++) {
@@ -462,8 +612,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
             #pragma unroll
             for (int nj = 0; nj < TILES_N; nj++) {
                 const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
-                const float as0 = act_scale[min(bc_frag,     M - 1)];
-                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
+                const float as0 = act_sc(bc_frag);
+                const float as1 = act_sc(bc_frag + 1);
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
                     #pragma unroll
@@ -488,7 +638,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
             constexpr int ROW_B = WARP_WR * 2;              // staged row pitch (bytes)
             constexpr int CPR   = WARP_WR / 8;              // 16-byte chunks per row (8 or 4)
             static_assert(CPR == 8 || CPR == 4, "staging swizzle assumes 4 or 8 chunks per row");
-            static_assert(SP_WARPS_WR * SP_WARPS_BC * WARP_BC * ROW_B <= SMEM_DB,
+            static_assert(SP_WARPS_WR * SP_WARPS_BC * WARP_BC * ROW_B <= (FQ ? SMEM_FQ_B : SMEM_DB),
                           "epilogue staging must fit in the pipeline buffers");
             // XOR swizzle of the 16-byte chunk: conflict-free for the 8-row fragment stores
             // and for the 16-byte row reads.
@@ -499,8 +649,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
             #pragma unroll
             for (int nj = 0; nj < TILES_N; nj++) {
                 const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
-                const float as0 = act_scale[min(bc_frag,     M - 1)];
-                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
+                const float as0 = act_sc(bc_frag);
+                const float as1 = act_sc(bc_frag + 1);
                 const int r = nj * 8 + groupID;                              // row after transpose
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
@@ -550,7 +700,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
 //  Kernel wrapper
 // ===========================================================================
 
-template <int BLOCK_WR_T, int BLOCK_BC_T>
+template <int BLOCK_WR_T, int BLOCK_BC_T, bool NF = false>
 __global__ void sparse_gemm_kernel(
     const int8_t*   __restrict__ W_comp,
     const int8_t*   __restrict__ x_int8,
@@ -563,9 +713,26 @@ __global__ void sparse_gemm_kernel(
     const int M, const int K, const int N_out,
     const int split_k, const int k_iters_per_split)
 {
-    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, sp_stages<BLOCK_WR_T, BLOCK_BC_T>()>(
+    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, sp_stages<BLOCK_WR_T, BLOCK_BC_T>(), false, NF>(
         W_comp, x_int8, w_meta, act_scale, w_scale, bias, output,
-        splitk_ws, M, K, N_out, split_k, k_iters_per_split);
+        splitk_ws, M, K, N_out, split_k, k_iters_per_split, nullptr, 0);
+}
+
+// Fused-quantize kernel: reads the fp16 activation, quantizes each 64-token block into a
+// resident smem block, runs every weight tile against it (see sparse_int8_linear).
+template <int BLOCK_WR_T, int BLOCK_BC_T>
+__global__ void sparse_gemm_fq_kernel(
+    const int8_t*   __restrict__ W_comp,
+    const uint32_t* __restrict__ w_meta,
+    const __half*   __restrict__ w_scale,
+    const __half*   __restrict__ bias,
+    __half*         __restrict__ output,
+    const int M, const int K, const int N_out,
+    const __half*   __restrict__ x_fp16, const int x_stream)
+{
+    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, sp_stages<BLOCK_WR_T, BLOCK_BC_T>(), true>(
+        W_comp, nullptr, w_meta, nullptr, w_scale, bias, output,
+        nullptr, M, K, N_out, 1, K / SP_BLOCK_K, x_fp16, x_stream);
 }
 
 // ===========================================================================
@@ -581,7 +748,9 @@ struct SpDeviceInfo {
     int smem_per_sm = 0;
     int reserved_smem_per_block = 0;
     int smem_optin = 0;
+    int l2_bytes = 0;
     int launch_smem[kSparseNumTiles] = {};   // dynamic smem per tile config, 0 = not set up
+    int fq_smem_set = 0;                     // max dynamic smem attribute set for the FQ kernel
 };
 
 // Per-device properties, queried once (128 SMs / 100 KB smem per SM on an RTX 4090).
@@ -596,6 +765,7 @@ SpDeviceInfo& sp_device_info() {
         cudaDeviceGetAttribute(&d.reserved_smem_per_block, cudaDevAttrReservedSharedMemoryPerBlock, dev);
         cudaDeviceGetAttribute(&d.smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&d.l2_bytes, cudaDevAttrL2CacheSize, dev);
         d.sm_count = (sms > 0) ? sms : 128;
     }
     return d;
@@ -613,9 +783,12 @@ int sp_launch_smem(SpDeviceInfo& d, int tile) {
         const int half = d.smem_per_sm / 2 - d.reserved_smem_per_block + 128;
         int s = (smem_k > half) ? smem_k : half;
         if (s > d.smem_optin) s = smem_k;
-        if (s > 48 * 1024)
-            cudaFuncSetAttribute(sparse_gemm_kernel<BW, BC>,
+        if (s > 48 * 1024) {
+            cudaFuncSetAttribute(sparse_gemm_kernel<BW, BC, false>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, s);
+            cudaFuncSetAttribute(sparse_gemm_kernel<BW, BC, true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, s);
+        }
         smem = s;
     }
     return smem;
@@ -633,9 +806,47 @@ void sp_launch(SpDeviceInfo& d, int tile, const int8_t* W_comp, const int8_t* x_
     const int nctas = (int)std::min<long long>(total, d.sm_count);
     const int k_iters_total = K / SP_BLOCK_K;
     const int k_iters_per_split = (k_iters_total + split_k - 1) / split_k;
-    sparse_gemm_kernel<BW, BC><<<nctas, SP_THREADS, smem, stream>>>(
-        W_comp, x_int8, w_meta, act_scale, w_scale, bias, output,
-        ws, M, K, N_out, split_k, k_iters_per_split);
+    // Tile order: M-fastest keeps a weight tile hot across consecutive M-tiles, but every
+    // weight-tile column then streams the whole int8 activation; once that exceeds L2 it is
+    // re-read from DRAM per column (3x for N_out = 320 on 128-row tiles). N-fastest reads it once.
+    if ((long long)M * K > (long long)d.l2_bytes)
+        sparse_gemm_kernel<BW, BC, true><<<nctas, SP_THREADS, smem, stream>>>(
+            W_comp, x_int8, w_meta, act_scale, w_scale, bias, output,
+            ws, M, K, N_out, split_k, k_iters_per_split);
+    else
+        sparse_gemm_kernel<BW, BC, false><<<nctas, SP_THREADS, smem, stream>>>(
+            W_comp, x_int8, w_meta, act_scale, w_scale, bias, output,
+            ws, M, K, N_out, split_k, k_iters_per_split);
+}
+
+// Fused quantize + sparse GEMM: 128-row weight tiles x 64-token activation blocks.
+constexpr int SP_FQ_BW = 128, SP_FQ_BC = 64;
+
+int sp_fq_smem_bytes(int K) {
+    return sp_fq_base_bytes<SP_FQ_BW, SP_FQ_BC>() + SP_FQ_BC * K + SP_FQ_BC * (int)sizeof(float);
+}
+
+bool sp_fq_fits(SpDeviceInfo& d, int K) {
+    return K % SP_BLOCK_K == 0 && K <= sp_fq_vpt<SP_FQ_BC>() * 256 && sp_fq_smem_bytes(K) <= d.smem_optin;
+}
+
+void sp_fq_launch(SpDeviceInfo& d, const __half* x, const int8_t* W_comp, const uint32_t* w_meta,
+                  const __half* w_scale, const __half* bias, __half* output,
+                  int M, int K, int N_out, cudaStream_t stream)
+{
+    constexpr int BW = SP_FQ_BW, BC = SP_FQ_BC;
+    const int smem = sp_fq_smem_bytes(K);
+    if (smem > d.fq_smem_set) {
+        cudaFuncSetAttribute(sparse_gemm_fq_kernel<BW, BC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        d.fq_smem_set = smem;
+    }
+    const long long tiles = (long long)divup(N_out, BW) * divup(M, BC);
+    const int nctas = (int)std::min<long long>(tiles, d.sm_count);
+    // Evict-first loads when x exceeds L2: it streams, and L2 is kept for the prefetched rows
+    const int x_stream = ((long long)M * K * 2 > (long long)d.l2_bytes) ? 1 : 0;
+    sparse_gemm_fq_kernel<BW, BC><<<nctas, SP_THREADS, smem, stream>>>(
+        W_comp, w_meta, w_scale, bias, output, M, K, N_out, x, x_stream);
 }
 
 } // namespace
@@ -656,8 +867,23 @@ void sp_launch(SpDeviceInfo& d, int tile, const int8_t* W_comp, const int8_t* x_
 // Wave quantization dominates small and mid shapes, which fixed M/N thresholds miss.
 // The coefficients are RTX 4090 numbers; only the SM count adapts to other GPUs.
 
+namespace {
+double sp_plan_cost(int M, int K, int N_out, int split_k, bool have_workspace, int tile,
+                    SparseGemmPlan* out);
+}
+
 SparseGemmPlan sparse_int8_gemm_plan(int M, int K, int N_out, int split_k,
                                      bool have_workspace, int tile)
+{
+    SparseGemmPlan plan;
+    sp_plan_cost(M, K, N_out, split_k, have_workspace, tile, &plan);
+    return plan;
+}
+
+namespace {
+// Cost-model minimum (ms) and the plan that reaches it.
+double sp_plan_cost(int M, int K, int N_out, int split_k, bool have_workspace, int tile,
+                    SparseGemmPlan* out)
 {
     static constexpr double kA[kSparseNumTiles] = {8.1730e-04, 4.0900e-04, 3.1130e-04};  // ms per K step per tile
     static constexpr double kB[kSparseNumTiles] = {3.5480e-03, 2.2260e-03, 1.2530e-03};  // ms per tile
@@ -689,7 +915,31 @@ SparseGemmPlan sparse_int8_gemm_plan(int M, int K, int N_out, int split_k,
             if (cost < best_cost) { best_cost = cost; plan.tile = t; plan.split_k = s; }
         }
     }
-    return plan;
+    *out = plan;
+    return best_cost;
+}
+
+// Path choice for the fp16-input layer. The two-pass path writes an int8 copy of x and the
+// GEMM reads it back: nearly free while x and the copy (3*M*K bytes) stay in L2, 2*M*K bytes
+// of DRAM traffic once they do not (measured cut-over between 83% and 94% of the 72 MiB L2,
+// which also holds weights and output; 90% used). The fused path saves that traffic but runs the small
+// 128x64 tile with the weights re-streamed from L2 per 64 tokens. Take it when the DRAM
+// time saved (at ~0.92 TB/s, RTX 4090 copy bandwidth) exceeds the cost-model penalty of the
+// 128x64 tile vs the best two-pass plan. Narrow N_out at huge M qualifies (1280->320 at
+// M=147456); wide N_out and every shape whose activation fits L2 stay on the two-pass path.
+bool sp_use_fused(SpDeviceInfo& d, int M, int K, int N_out) {
+    if (M <= 0 || !sp_fq_fits(d, K)) return false;
+    if (3.0 * M * K <= 0.9 * (double)d.l2_bytes) return false;
+    SparseGemmPlan p;
+    const double fused = sp_plan_cost(M, K, N_out, 1, false, kSparseTile128x64, &p);
+    const double best  = sp_plan_cost(M, K, N_out, 0, true, kSparseTileAuto, &p);
+    constexpr double kDramBytesPerMs = 0.92e9;
+    return fused - best < 2.0 * M * K / kDramBytesPerMs;
+}
+} // namespace
+
+bool sparse_int8_linear_fused(int M, int K, int N_out) {
+    return sp_use_fused(sp_device_info(), M, K, N_out);
 }
 
 void splitk_reduce(
@@ -766,8 +1016,23 @@ void sparse_int8_linear(
     float*          scratch_x_scale,
     float*          splitk_workspace,
     int             split_k,
-    cudaStream_t    stream)
+    cudaStream_t    stream,
+    int             path)
 {
+    if (M <= 0 || K <= 0 || N_out <= 0) return;
+    // Fused quantize + GEMM (one kernel, no int8 round trip): forced, or chosen by
+    // sp_use_fused when the caller did not ask for a specific split-K. x must be 16-byte
+    // aligned (16-byte vector loads).
+    SpDeviceInfo& d = sp_device_info();
+    const bool aligned = (reinterpret_cast<uintptr_t>(x) % 16) == 0;
+    const bool fused = aligned && sp_fq_fits(d, K) &&
+        (path == kSparseLinearFused ||
+         (path == kSparseLinearAuto && split_k <= 1 && sp_use_fused(d, M, K, N_out)));
+    if (fused) {
+        sp_fq_launch(d, x, W_comp, w_meta, w_scale, bias, output, M, K, N_out, stream);
+        return;
+    }
+
     // Step 1: quantize activation
     forge::quant::fused_quantize_activation(x, scratch_x_int8, scratch_x_scale, M, K, stream);
 
