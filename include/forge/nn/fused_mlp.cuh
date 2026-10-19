@@ -14,6 +14,11 @@
 // For H > 128 (up to 256): weights read from L2 cache, activations still
 //   flow through shared memory.  Slightly lower throughput but still fully
 //   fused -- no intermediate global memory between layers.
+//   A wide input layer (n_inputs > hidden) whose weight tile would overflow
+//   shared memory takes smaller tiles / L2 mode the same way.
+//
+// Shape limits (checked; violating them aborts with a message):
+//   1 <= hidden <= 256, 1 <= n_outputs <= hidden, 1 <= n_inputs <= 4096.
 //
 // TF32 Tensor Core path (use_tf32=true, requires sm_80+ and hidden % 16 == 0):
 //   Uses wmma 16x16x8 TF32 fragments for hidden-layer matmuls.
@@ -48,7 +53,7 @@ enum class Activation { CELU, GELU, ReLU, Sigmoid, SiLU, Tanh };
 /// safe: an unset `use_tf32` means the FP32 path, never stack garbage.
 struct MlpDesc {
     int        n_inputs     = 0;      // input dimension  (e.g. 9)
-    int        n_outputs    = 0;      // output dimension (e.g. 2)
+    int        n_outputs    = 0;      // output dimension (e.g. 2), <= hidden
     int        hidden       = 0;      // hidden width     (e.g. 64, max 256)
     int        n_layers     = 0;      // number of hidden layers (e.g. 5)
     Activation act          = Activation::CELU;  // activation for hidden layers

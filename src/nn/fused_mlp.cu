@@ -26,9 +26,11 @@
 #include <forge/nn/rng.cuh>
 #include <forge/primitives/activation.cuh>
 #include "cuda_utils.cuh"
+#include <forge/error.h>
 #include <mma.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace forge { namespace nn {
 
@@ -1427,6 +1429,58 @@ static bool gpu_supports_tf32(int device = 0) {
     return cached_major >= 8;
 }
 
+/// Opt-in per-block shared memory limit in bytes (cached).
+static size_t smem_optin_bytes(int device = 0) {
+    static int cached = -1;
+    if (cached < 0)
+        cudaDeviceGetAttribute(&cached, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    return (size_t)cached;
+}
+
+// Dynamic shared memory (bytes) of each kernel; must match the carve-up
+// inside the kernels.
+static size_t smem_scalar_fwd(const MlpDesc& d, int tile_b) {
+    int stride = ((d.hidden > d.n_inputs) ? d.hidden : d.n_inputs) + 1;
+    size_t f = (tile_b <= 2) ? (size_t)tile_b * stride
+                             : (size_t)d.hidden * stride + d.hidden + (size_t)tile_b * stride;
+    return f * sizeof(float);
+}
+static size_t smem_scalar_bwd(const MlpDesc& d, int tile_b) {
+    int stride = ((d.hidden > d.n_inputs) ? d.hidden : d.n_inputs) + 1;
+    size_t f = (tile_b <= 2) ? (size_t)tile_b * stride * 2
+                             : (size_t)d.hidden * stride + d.hidden + (size_t)tile_b * stride * 2;
+    return f * sizeof(float);
+}
+constexpr int TC_FWD_TILE = 32;
+constexpr int TC_BWD_TILE = 16;
+static size_t smem_tc_fwd(const MlpDesc& d) {
+    int k = (d.hidden > d.n_inputs) ? d.hidden : d.n_inputs;
+    k = (k + 7) & ~7;
+    return ((size_t)d.hidden * k + d.hidden + 2 * TC_FWD_TILE * (size_t)k) * sizeof(float);
+}
+static size_t smem_tc_bwd(const MlpDesc& d) {
+    int k = tc_bwd_k_max(d.hidden, d.n_inputs);
+    return ((size_t)d.hidden * k + 3 * TC_BWD_TILE * (size_t)k) * sizeof(float);
+}
+
+/// Shape check shared by forward/backward. The kernels stage output-layer
+/// weights/biases in hidden-row buffers (n_outputs <= hidden) and keep at
+/// most MAX_REGS staged values per thread (n_inputs <= MAX_REGS * block at
+/// TILE_B=1); outside these limits they would corrupt shared/local memory.
+static void validate_desc(const MlpDesc& d, const char* fn) {
+    if (d.hidden < 1 || d.hidden > MAX_H || d.n_layers < 1 || d.n_inputs < 1
+        || d.n_outputs < 1 || d.n_outputs > d.hidden
+        || d.n_inputs > MAX_REGS * BWD_BLOCK) {
+        std::fprintf(stderr,
+            "Forge %s: unsupported MLP shape (n_inputs=%d n_outputs=%d hidden=%d "
+            "n_layers=%d); need 1 <= hidden <= %d, 1 <= n_outputs <= hidden, "
+            "1 <= n_inputs <= %d, n_layers >= 1\n",
+            fn, d.n_inputs, d.n_outputs, d.hidden, d.n_layers, MAX_H,
+            MAX_REGS * BWD_BLOCK);
+        std::abort();
+    }
+}
+
 /// Check if TC path can be used for the given descriptor and batch size.
 static bool can_use_tc(const MlpDesc& desc, int B) {
     return desc.use_tf32
@@ -1434,6 +1488,15 @@ static bool can_use_tc(const MlpDesc& desc, int B) {
         && (desc.hidden <= 128)   // TC kernel needs weights in shared memory
         && (B >= 16)              // TILE_B=16 minimum
         && gpu_supports_tf32();
+}
+// The TC kernels keep the whole [hidden, max(hidden, n_inputs)] weight tile
+// in shared memory; a wide input layer can exceed the opt-in limit, in which
+// case the scalar path (which can drop to L2 mode) is used instead.
+static bool can_use_tc_fwd(const MlpDesc& d, int B) {
+    return can_use_tc(d, B) && smem_tc_fwd(d) <= smem_optin_bytes();
+}
+static bool can_use_tc_bwd(const MlpDesc& d, int B) {
+    return can_use_tc(d, B) && smem_tc_bwd(d) <= smem_optin_bytes();
 }
 
 // ============================================================
@@ -1473,6 +1536,26 @@ static int select_tile_b_forward(int B, int hidden) {
     return (B >= 4) ? 4 : (B >= 2) ? 2 : 1;
 }
 
+// Final scalar-path tile sizes: halve the occupancy-driven choice until the
+// launch fits. Only wide inputs (n_inputs > hidden) ever trigger this; the
+// L2-mode tiles (<= 2) need only a few KB of shared memory.
+static int fwd_tile(const MlpDesc& d, int B) {
+    int tile_b = select_tile_b_forward(B, d.hidden);
+    while (tile_b > 2 && smem_scalar_fwd(d, tile_b) > smem_optin_bytes())
+        tile_b /= 2;
+    return tile_b;
+}
+// Backward additionally stages TILE_B * max(hidden, n_inputs) / BWD_BLOCK
+// propagated values per thread in a MAX_REGS register array.
+static int bwd_tile(const MlpDesc& d, int B) {
+    int w_cols = (d.hidden > d.n_inputs) ? d.hidden : d.n_inputs;
+    int tile_b = select_tile_b(B, d.hidden);
+    while (tile_b > 1 && (tile_b * w_cols > MAX_REGS * BWD_BLOCK
+                          || smem_scalar_bwd(d, tile_b) > smem_optin_bytes()))
+        tile_b /= 2;
+    return tile_b;
+}
+
 // ============================================================
 //  Host launch functions
 // ============================================================
@@ -1487,6 +1570,7 @@ void fused_mlp_forward(
     cudaStream_t   stream)
 {
     if (B <= 0) return;
+    validate_desc(desc, "fused_mlp_forward");
 
     int norm_offset = 0;
     if (desc.normalize) {
@@ -1496,11 +1580,11 @@ void fused_mlp_forward(
     }
 
     // ---- TC path (TF32 Tensor Cores) ----
-    if (can_use_tc(desc, B)) {
+    if (can_use_tc_fwd(desc, B)) {
         // Tile size 32: more work per block, better amortization of weight loads.
         // Shared memory: s_W[H*H] + s_bias[H] + 2*s_act[32*H] = 64KB + 0.5KB + 32KB = 96.5KB
-        // Fits within 100KB SM limit for H<=128.
-        constexpr int tc_tile = 32;
+        // Fits within 100KB SM limit for H<=128 when n_inputs <= hidden.
+        constexpr int tc_tile = TC_FWD_TILE;
         int grid  = internal::divup(B, tc_tile);
         int block = FWD_BLOCK;
 
@@ -1522,7 +1606,8 @@ void fused_mlp_forward(
 
         auto kernel_fn = fused_mlp_forward_tc_kernel<tc_tile>;
         if (smem > 48 * 1024)
-            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            FORGE_CHECK(cudaFuncSetAttribute(kernel_fn,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_fn<<<grid, block, smem, stream>>>(
             desc.n_inputs, desc.n_outputs, desc.hidden, desc.n_layers,
             desc.act, desc.act_param, desc.output_scale, desc.normalize, norm_offset,
@@ -1531,7 +1616,7 @@ void fused_mlp_forward(
     }
 
     // ---- Scalar path ----
-    int tile_b = select_tile_b_forward(B, desc.hidden);
+    int tile_b = fwd_tile(desc, B);
     int grid   = internal::divup(B, tile_b);
     int block  = FWD_BLOCK;
 
@@ -1548,7 +1633,8 @@ void fused_mlp_forward(
 
     auto launch = [&](auto kernel_fn) {
         if (smem > 48 * 1024)
-            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            FORGE_CHECK(cudaFuncSetAttribute(kernel_fn,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_fn<<<grid, block, smem, stream>>>(
             desc.n_inputs, desc.n_outputs, desc.hidden, desc.n_layers,
             desc.act, desc.act_param, desc.output_scale, desc.normalize, norm_offset,
@@ -1579,6 +1665,7 @@ void fused_mlp_backward(
     float*         workspace)
 {
     if (B <= 0) return;
+    validate_desc(desc, "fused_mlp_backward");
 
     int n_w = mlp_weight_count(desc);
 
@@ -1590,8 +1677,8 @@ void fused_mlp_backward(
     }
 
     // ---- TC path (TF32 Tensor Cores) ----
-    if (can_use_tc(desc, B)) {
-        constexpr int tc_tile = 16;
+    if (can_use_tc_bwd(desc, B)) {
+        constexpr int tc_tile = TC_BWD_TILE;
         int grid  = internal::divup(B, tc_tile);
         int block = BWD_BLOCK;
 
@@ -1625,7 +1712,8 @@ void fused_mlp_backward(
 
         auto kernel_fn = fused_mlp_backward_tc_kernel<tc_tile>;
         if (smem > 48 * 1024)
-            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            FORGE_CHECK(cudaFuncSetAttribute(kernel_fn,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_fn<<<grid, block, smem, stream>>>(
             desc.n_inputs, desc.n_outputs, desc.hidden, desc.n_layers,
             desc.act, desc.act_param, desc.output_scale, desc.normalize, norm_offset,
@@ -1643,7 +1731,7 @@ void fused_mlp_backward(
     }
 
     // ---- Scalar path ----
-    int tile_b = select_tile_b(B, desc.hidden);
+    int tile_b = bwd_tile(desc, B);
     int grid   = internal::divup(B, tile_b);
     int block  = BWD_BLOCK;
 
@@ -1676,7 +1764,8 @@ void fused_mlp_backward(
 
     auto launch = [&](auto kernel_fn) {
         if (smem > 48 * 1024)
-            cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            FORGE_CHECK(cudaFuncSetAttribute(kernel_fn,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_fn<<<grid, block, smem, stream>>>(
             desc.n_inputs, desc.n_outputs, desc.hidden, desc.n_layers,
             desc.act, desc.act_param, desc.output_scale, desc.normalize, norm_offset,
@@ -1703,11 +1792,8 @@ void fused_mlp_backward(
 }
 
 int fused_mlp_backward_workspace_count(const MlpDesc& desc, int B) {
-    int tile_b;
-    if (can_use_tc(desc, B))
-        tile_b = 16;  // TC tile size
-    else
-        tile_b = select_tile_b(B, desc.hidden);
+    validate_desc(desc, "fused_mlp_backward_workspace_count");
+    int tile_b = can_use_tc_bwd(desc, B) ? TC_BWD_TILE : bwd_tile(desc, B);
     int n_blocks = internal::divup(B, tile_b);
     if (n_blocks <= 1) return 0;
     // Cap to match persistent kernel grid (prevents int overflow at large B)

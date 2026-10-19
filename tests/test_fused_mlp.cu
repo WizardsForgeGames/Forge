@@ -262,16 +262,18 @@ struct SweepCase {
     float beta;
 };
 
-// Tolerances are normalized errors (max|err| / max|ref|).
-//  FP32 path: observed <= 1e-6 across the sweep; 1e-4 leaves ~100x margin
-//  for accumulation-order differences (atomics / per-block reduction).
+// Tolerances are normalized errors (max|err| / max|ref|). Observed maxima
+// below are from a 384-config sweep (H 16..256, L 1..6, B 1..20000,
+// n_inputs 3..200, all activations, normalize/workspace/beta on and off).
+//  FP32 path: observed <= 2.4e-6; 1e-4 leaves ~40x margin for
+//  accumulation-order differences (atomics / per-block reduction).
 //  TF32 path: wmma TF32 keeps 10 explicit mantissa bits, so each operand
 //  carries up to 2^-10 ~ 9.8e-4 relative error (the hardware drops the low
 //  13 bits of an unconverted FP32 operand) and each product up to ~2e-3,
-//  accumulated in FP32. Observed: per-layer pre-activations <= 8.2e-4,
-//  dW <= 7.5e-4, d_input (L TF32 propagations deep) <= 4.6e-3. 1e-2 sits
-//  ~2x above the worst observed while any indexing/race bug shows up as
-//  O(0.1-1).
+//  accumulated in FP32. Observed: per-layer pre-activations <= 9.1e-4,
+//  dW <= 1.5e-3, d_input (L TF32 propagations deep) <= 4.7e-3. 1e-2 sits
+//  ~2x above the worst observed, while the indexing/race bugs this sweep
+//  was written against showed up at 0.03-1.8.
 static bool run_sweep_case(const SweepCase& c, uint64_t seed) {
     nn::MlpDesc d;
     d.n_inputs = c.IN; d.n_outputs = c.OUT; d.hidden = c.H; d.n_layers = c.L;
@@ -585,6 +587,12 @@ int main() {
             {"fp32_ws_l2",         9,  2, 256, 3,  257, A::Tanh,    false, false, true,  0.0f},
             {"tf32_workspace",     9,  2,  64, 5, 5000, A::SiLU,    true,  false, true,  0.0f},
             {"tf32_ws_norm_beta", 17,  4,  32, 6, 5001, A::GELU,    true,  true,  true,  1.0f},
+            // n_inputs > hidden with a weight tile too wide for shared memory
+            // at the occupancy-preferred tile: forces smaller tiles / L2 mode
+            // and the TF32 -> scalar fallback.
+            {"fp32_wide_input",  200,  5, 128, 2,   64, A::SiLU,    false, false, false, 0.0f},
+            {"fp32_wide_in_big", 200,  5, 128, 2, 9000, A::CELU,    false, true,  true,  0.0f},
+            {"tf32_wide_input",  200,  5, 128, 2, 9000, A::Tanh,    true,  false, true,  1.0f},
         };
         bool all_ok = true;
         uint64_t seed = 1000;
