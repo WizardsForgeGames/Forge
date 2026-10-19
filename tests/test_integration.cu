@@ -24,6 +24,10 @@ int main() {
         Tensor t_pred = Tensor::empty({N});
         Tensor t_target = Tensor::empty({N});
         Tensor t_loss = Tensor::zeros({1});
+        // The factories ran on Forge's non-blocking stream; the raw-pointer
+        // copies and mse_forward below use the legacy default stream, which
+        // does not order against it (zeros' memset could land after mse).
+        FORGE_CHECK(cudaDeviceSynchronize());
 
         // Upload data via raw pointers
         cudaMemcpy(t_pred.data<float>(), h_pred.data(),

@@ -403,8 +403,15 @@ int main() {
 
         Tensor input  = Tensor::zeros({1, (int64_t)ag_Cin, 4, 4});
         Tensor weight = Tensor::zeros({(int64_t)ag_Cout, (int64_t)ag_Cin, 3, 3});
+        // Tensor::zeros memsets on Forge's non-blocking stream, which the
+        // legacy-stream cudaMemcpy below does not order against: without the
+        // first sync the memset can land after the copy and zero the input;
+        // without the second, conv2d can read before the pageable copy's DMA
+        // has landed.
+        FORGE_CHECK(cudaDeviceSynchronize());
         cudaMemcpy(input.data<float>(), h_in.data(), h_in.size() * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(weight.data<float>(), h_w.data(), h_w.size() * sizeof(float), cudaMemcpyHostToDevice);
+        FORGE_CHECK(cudaDeviceSynchronize());
         input.set_requires_grad_(true);
         weight.set_requires_grad_(true);
 
@@ -425,21 +432,25 @@ int main() {
             ok = false;
         }
 
-        // Verify gradients are non-zero (sanity check)
+        // Verify values: loss = sum(output) => d_output = ones.
+        // Forge runs on a non-blocking stream, which the legacy-stream
+        // cudaMemcpy in to_host() does not wait for -- sync first.
         if (ok) {
-            auto ig_h = test::to_host(ig.data<float>(), ig.numel());
-            auto wg_h = test::to_host(wg.data<float>(), wg.numel());
-            float ig_sum = 0, wg_sum = 0;
-            for (auto v : ig_h) ig_sum += std::abs(v);
-            for (auto v : wg_h) wg_sum += std::abs(v);
-            if (ig_sum < 1e-6f) {
-                std::fprintf(stderr, "FAIL [conv2d_autograd]: input.grad() all zeros\n");
-                ok = false;
-            }
-            if (wg_sum < 1e-6f) {
-                std::fprintf(stderr, "FAIL [conv2d_autograd]: weight.grad() all zeros\n");
-                ok = false;
-            }
+            FORGE_CHECK(cudaDeviceSynchronize());
+            auto ig_h  = test::to_host(ig.data<float>(), ig.numel());
+            auto wg_h  = test::to_host(wg.data<float>(), wg.numel());
+            auto out_h = test::to_host(output.data<float>(), output.numel());
+            std::vector<float> ones(out_h.size(), 1.0f);
+            std::vector<float> ref_out(out_h.size()), ref_ig(ig_h.size()), ref_wg(wg_h.size());
+            conv2d_fwd_cpu(h_in.data(), h_w.data(), nullptr, ref_out.data(),
+                           1, ag_Cin, 4, 4, ag_Cout, 3, 3, 1, 1, 1, 1, 1, 1, 1);
+            conv2d_bwd_data_cpu(ones.data(), h_w.data(), ref_ig.data(),
+                                1, ag_Cin, 4, 4, ag_Cout, 3, 3, 1, 1, 1, 1, 1, 1, 1);
+            conv2d_bwd_weight_cpu(ones.data(), h_in.data(), ref_wg.data(), nullptr,
+                                  1, ag_Cin, 4, 4, ag_Cout, 3, 3, 1, 1, 1, 1, 1, 1, 1, 0.0f);
+            ok &= test::check_arrays(out_h, ref_out, 1e-4f, 1e-3f, "conv2d_autograd_fwd");
+            ok &= test::check_arrays(ig_h, ref_ig, 1e-4f, 1e-3f, "conv2d_autograd_dinput");
+            ok &= test::check_arrays(wg_h, ref_wg, 1e-4f, 1e-3f, "conv2d_autograd_dweight");
         }
 
         if (ok) std::printf("  PASS [conv2d_autograd]\n");

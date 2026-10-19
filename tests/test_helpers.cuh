@@ -33,12 +33,19 @@ inline void fill_zeros(std::vector<float>& v) {
 
 // ---------- Device transfers ----------
 
+// Forge's tensor ops run on a per-thread cudaStreamNonBlocking stream, which
+// does not order against the legacy default stream these helpers use. A
+// pageable cudaMemcpy H2D may return before its DMA lands, and cudaMemset is
+// asynchronous, so both helpers synchronize the device before returning:
+// otherwise a Forge op launched next can read the buffer's previous contents.
+
 template<typename T>
 T* to_device(const std::vector<T>& host) {
     T* d;
     FORGE_CHECK(cudaMalloc(&d, host.size() * sizeof(T)));
     FORGE_CHECK(cudaMemcpy(d, host.data(), host.size() * sizeof(T),
                            cudaMemcpyHostToDevice));
+    FORGE_CHECK(cudaDeviceSynchronize());
     return d;
 }
 
@@ -47,6 +54,7 @@ T* to_device_zeroed(size_t count) {
     T* d;
     FORGE_CHECK(cudaMalloc(&d, count * sizeof(T)));
     FORGE_CHECK(cudaMemset(d, 0, count * sizeof(T)));
+    FORGE_CHECK(cudaDeviceSynchronize());
     return d;
 }
 

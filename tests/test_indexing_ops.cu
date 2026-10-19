@@ -186,7 +186,7 @@ int main() {
         std::vector<float> hd = {1, 2, 3, 4, 5, 6};
         std::vector<uint8_t> hm = {1, 0, 1, 0, 1, 0};
         float* dd = test::to_device(hd);
-        uint8_t* dm; cudaMalloc(&dm, 6); cudaMemcpy(dm, hm.data(), 6, cudaMemcpyHostToDevice);
+        uint8_t* dm = test::to_device(hm);
         Tensor data = Tensor::from_ptr(dd, {2, 3});
         Tensor mask = Tensor::from_blob(dm, {2, 3}, DType::Bool);
 
@@ -207,7 +207,7 @@ int main() {
         std::vector<float> hd = {1,2,3,4, 5,6,7,8, 9,10,11,12};
         std::vector<uint8_t> hm = {1, 0, 0, 1};
         float* dd = test::to_device(hd);
-        uint8_t* dm; cudaMalloc(&dm, 4); cudaMemcpy(dm, hm.data(), 4, cudaMemcpyHostToDevice);
+        uint8_t* dm = test::to_device(hm);
         Tensor data = Tensor::from_ptr(dd, {3, 4});
         Tensor mask = Tensor::from_blob(dm, {4}, DType::Bool);
 
@@ -228,7 +228,7 @@ int main() {
         std::vector<float> hd = {10, 20, 30, 40, 50};
         std::vector<uint8_t> hm = {1, 0, 1, 0, 1};
         float* dd = test::to_device(hd);
-        uint8_t* dm; cudaMalloc(&dm, 5); cudaMemcpy(dm, hm.data(), 5, cudaMemcpyHostToDevice);
+        uint8_t* dm = test::to_device(hm);
         Tensor data = Tensor::from_ptr(dd, {5});
         Tensor mask = Tensor::from_blob(dm, {5}, DType::Bool);
 

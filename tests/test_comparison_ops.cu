@@ -136,8 +136,8 @@ int main() {
     {
         std::vector<uint8_t> ha = {1, 1, 0, 0};
         std::vector<uint8_t> hb = {1, 0, 1, 0};
-        uint8_t* da; cudaMalloc(&da, 4); cudaMemcpy(da, ha.data(), 4, cudaMemcpyHostToDevice);
-        uint8_t* db; cudaMalloc(&db, 4); cudaMemcpy(db, hb.data(), 4, cudaMemcpyHostToDevice);
+        uint8_t* da = test::to_device(ha);
+        uint8_t* db = test::to_device(hb);
         Tensor a = Tensor::from_blob(da, {4}, DType::Bool);
         Tensor b = Tensor::from_blob(db, {4}, DType::Bool);
 
@@ -215,7 +215,7 @@ int main() {
         std::vector<float> hx = {10, 20, 30, 40, 50};
         std::vector<float> hy = {-1, -2, -3, -4, -5};
 
-        uint8_t* dc; cudaMalloc(&dc, 5); cudaMemcpy(dc, hc.data(), 5, cudaMemcpyHostToDevice);
+        uint8_t* dc = test::to_device(hc);
         float* dx = test::to_device(hx);
         float* dy = test::to_device(hy);
         Tensor cond = Tensor::from_blob(dc, {5}, DType::Bool);
@@ -243,7 +243,7 @@ int main() {
         std::vector<float> hx = {10,20, 30,40, 50,60};
         std::vector<float> hy = {-1.0f};
 
-        uint8_t* dc; cudaMalloc(&dc, 3); cudaMemcpy(dc, hc.data(), 3, cudaMemcpyHostToDevice);
+        uint8_t* dc = test::to_device(hc);
         float* dx = test::to_device(hx);
         float* dy = test::to_device(hy);
         Tensor cond = Tensor::from_blob(dc, {3, 1}, DType::Bool);
@@ -269,21 +269,21 @@ int main() {
     {
         // All true
         std::vector<uint8_t> h1 = {1, 1, 1, 1};
-        uint8_t* d1; cudaMalloc(&d1, 4); cudaMemcpy(d1, h1.data(), 4, cudaMemcpyHostToDevice);
+        uint8_t* d1 = test::to_device(h1);
         Tensor t1 = Tensor::from_blob(d1, {4}, DType::Bool);
         FORGE_ASSERT(forge::any(t1) == true, "any: all-true should be true");
         FORGE_ASSERT(forge::all(t1) == true, "all: all-true should be true");
 
         // Some true
         std::vector<uint8_t> h2 = {0, 0, 1, 0};
-        uint8_t* d2; cudaMalloc(&d2, 4); cudaMemcpy(d2, h2.data(), 4, cudaMemcpyHostToDevice);
+        uint8_t* d2 = test::to_device(h2);
         Tensor t2 = Tensor::from_blob(d2, {4}, DType::Bool);
         FORGE_ASSERT(forge::any(t2) == true, "any: some-true should be true");
         FORGE_ASSERT(forge::all(t2) == false, "all: some-true should be false");
 
         // All false
         std::vector<uint8_t> h3 = {0, 0, 0, 0};
-        uint8_t* d3; cudaMalloc(&d3, 4); cudaMemcpy(d3, h3.data(), 4, cudaMemcpyHostToDevice);
+        uint8_t* d3 = test::to_device(h3);
         Tensor t3 = Tensor::from_blob(d3, {4}, DType::Bool);
         FORGE_ASSERT(forge::any(t3) == false, "any: all-false should be false");
         FORGE_ASSERT(forge::all(t3) == false, "all: all-false should be false");
