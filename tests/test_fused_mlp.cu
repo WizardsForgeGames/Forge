@@ -313,7 +313,11 @@ static bool run_sweep_case(const SweepCase& c, uint64_t seed) {
     int ws_count = 0;
     if (c.workspace) {
         ws_count = nn::fused_mlp_backward_workspace_count(d, B);
-        if (ws_count > 0) d_ws = test::to_device_zeroed<float>(ws_count);
+        if (ws_count > 0) {
+            // Poison with NaN: the library must not depend on caller zeroing.
+            d_ws = test::to_device_zeroed<float>(ws_count);
+            FORGE_CHECK(cudaMemset(d_ws, 0xFF, (size_t)ws_count * sizeof(float)));
+        }
     }
 
     nn::fused_mlp_forward(d, d_x, d_w, d_y, B, d_acts);
@@ -576,6 +580,11 @@ int main() {
             {"fp32_normalize",     9,  2,  64, 3,  600, A::Tanh,    false, true,  false, 0.0f},
             {"fp32_norm_l2",       9,  2, 192, 2,   64, A::CELU,    false, true,  false, 0.0f},
             {"tf32_normalize",     9,  2,  64, 3,  600, A::GELU,    true,  true,  false, 0.0f},
+            {"fp32_workspace",     9,  2,  64, 5, 20000, A::CELU,   false, false, true,  0.0f},
+            {"fp32_ws_norm_beta",  9,  2,  64, 3,  600, A::ReLU,    false, true,  true,  1.0f},
+            {"fp32_ws_l2",         9,  2, 256, 3,  257, A::Tanh,    false, false, true,  0.0f},
+            {"tf32_workspace",     9,  2,  64, 5, 5000, A::SiLU,    true,  false, true,  0.0f},
+            {"tf32_ws_norm_beta", 17,  4,  32, 6, 5001, A::GELU,    true,  true,  true,  1.0f},
         };
         bool all_ok = true;
         uint64_t seed = 1000;

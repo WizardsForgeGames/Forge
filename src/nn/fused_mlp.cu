@@ -1606,6 +1606,10 @@ void fused_mlp_backward(
         if (workspace && grid > 1) {
             grad_scratch   = workspace;
             scratch_stride = n_w;
+            // Blocks accumulate (+=) into their slice across grid-stride
+            // tiles, and never write the normalization-bound slots that the
+            // reduction still sums -- the slices must start at zero.
+            cudaMemsetAsync(grad_scratch, 0, (size_t)grid * n_w * sizeof(float), stream);
         } else if (beta == 0.0f) {
             cudaMemsetAsync(d_weights, 0, n_w * sizeof(float), stream);
         }
@@ -1652,6 +1656,8 @@ void fused_mlp_backward(
     if (workspace && grid > 1) {
         grad_scratch  = workspace;
         scratch_stride = n_w;
+        // See TC path: per-block slices are accumulated into, so zero them.
+        cudaMemsetAsync(grad_scratch, 0, (size_t)grid * n_w * sizeof(float), stream);
     } else if (beta == 0.0f) {
         cudaMemsetAsync(d_weights, 0, n_w * sizeof(float), stream);
     }

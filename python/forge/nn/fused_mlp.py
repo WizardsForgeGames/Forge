@@ -82,14 +82,11 @@ class _FusedMLPFn(torch.autograd.Function):
         d_input = torch.empty_like(input) if ctx.needs_input_grad[0] else None
 
         # Optionally use workspace for per-block gradients (no atomicAdd).
-        # MUST be zero-initialized: when normalize=True, mlp_weight_count
-        # includes normalization bounds, but the backward kernel only writes
-        # gradients for actual weights/biases. Without zeroing, uninitialized
-        # workspace positions for norm bounds produce garbage after reduction.
+        # fused_mlp_backward zeroes the slices it uses, so no fill is needed.
         ws_count = _C.fused_mlp_backward_workspace_count(
             n_inputs, n_outputs, hidden, n_layers,
             activation, act_param, output_scale, normalize, use_tf32, B)
-        workspace = torch.zeros(ws_count, device=input.device) if ws_count > 0 else None
+        workspace = torch.empty(ws_count, device=input.device) if ws_count > 0 else None
 
         _C.fused_mlp_backward(
             n_inputs, n_outputs, hidden, n_layers,

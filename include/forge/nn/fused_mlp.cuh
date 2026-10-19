@@ -96,7 +96,8 @@ void fused_mlp_forward(
 /// workspace: optional per-block gradient scratch buffer. When provided,
 ///            each block writes gradients to a private slice (no atomicAdd),
 ///            then a reduction kernel sums across blocks into d_weights.
-///            Allocate with fused_mlp_backward_workspace_count() floats.
+///            Allocate with fused_mlp_backward_workspace_count() floats;
+///            contents on entry are ignored (the call zeroes what it uses).
 void fused_mlp_backward(
     const MlpDesc& desc,
     const float*   input,
