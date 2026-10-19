@@ -907,16 +907,21 @@ __global__ void fused_mlp_backward_kernel(
             }
             __syncthreads();
         } else if (l == 0 && d_input) {
+            // prop_regs hold dL/d(normalized input); chain through the
+            // min-max normalization x' = 2(x - lb)/(ub - lb) - 1.
+            const float* lb = weights + norm_offset;
+            const float* ub = lb + n_inputs;
             prop_count = 0;
             int total = n_active * n_inputs;
             for (int idx = tid; idx < total; idx += blockDim.x) {
                 int s = idx / n_inputs;
                 int k = idx % n_inputs;
                 int b_i = b_base + s;
+                float g = prop_regs[prop_count++];
+                if (do_normalize)
+                    g *= 2.0f / (ub[k] - lb[k]);
                 if (b_i < B)
-                    d_input[b_i * n_inputs + k] = prop_regs[prop_count++];
-                else
-                    prop_count++;
+                    d_input[b_i * n_inputs + k] = g;
             }
         }
     }  // end layer loop
@@ -1367,13 +1372,20 @@ fused_mlp_backward_tc_kernel(
             }
             __syncthreads();
         } else if (d_input) {
+            // s_prop holds dL/d(normalized input); chain through the
+            // min-max normalization x' = 2(x - lb)/(ub - lb) - 1.
+            const float* lb = weights + norm_offset;
+            const float* ub = lb + n_inputs;
             int total = n_active * n_inputs;
             for (int idx = tid; idx < total; idx += blockDim.x) {
                 int s = idx / n_inputs;
                 int k = idx % n_inputs;
                 int b_i = b_base + s;
+                float g = s_prop[s * a_stride + k];
+                if (do_normalize)
+                    g *= 2.0f / (ub[k] - lb[k]);
                 if (b_i < B)
-                    d_input[b_i * n_inputs + k] = s_prop[s * a_stride + k];
+                    d_input[b_i * n_inputs + k] = g;
             }
         }
     }  // end layer loop

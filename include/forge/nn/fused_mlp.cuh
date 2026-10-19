@@ -89,7 +89,8 @@ void fused_mlp_forward(
 /// weights:   packed weights (same as forward)
 /// acts_save: pre-activation saves from forward (required)
 /// d_output:  [B, n_outputs] upstream gradient
-/// d_input:   [B, n_inputs]  gradient w.r.t. input (nullptr to skip)
+/// d_input:   [B, n_inputs]  gradient w.r.t. the raw input (nullptr to skip);
+///            with normalize=true this includes the 2/(ub - lb) chain factor
 /// d_weights: packed gradient buffer (same layout as weights)
 /// beta:      0.0 = overwrite d_weights, 1.0 = accumulate
 /// workspace: optional per-block gradient scratch buffer. When provided,
