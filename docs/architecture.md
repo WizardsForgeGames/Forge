@@ -291,14 +291,14 @@ Auto-selects 128x64 (narrow) or 128x128 (wide) tile. `int8_linear()` convenience
 
 ### INT8 Sparse Tensor Core (`gemm/int8_sparse`)
 PTX `mma.sp` instruction. 2:4 structured sparsity (the hardware's peak sparse INT8 rate is 2x dense). Derived from [sparsemma](https://github.com/WizardsForgeGames/sparsemma).
-Standard vs. warp-specialized variant. Split-K support.
+Persistent CTAs (one per SM), 3-stage `cp.async` pipeline that also stages the sparsity metadata, `ldmatrix.x4` fragments and one `mma.sp m16n8k64` per tile per 64-deep K step, register dequant + `movmatrix` transpose epilogue with 16-byte stores. Three tile configs (256x128, 128x128, 128x64) and split-K (fp32 workspace + reduce) are chosen by a wave-aware cost model (`sparse_int8_gemm_plan()`).
 
 ---
 
 ## Layer 6: Quantization (`forge::quant`)
 
 ### Quantize (`quant/quantize`)
-`fused_quantize_activation_kernel` — FP16 `(M,K)` → INT8 `(M,K)` + scales `(M,)`. One block per row. Two-pass: parallel max reduction → quantize.
+`fused_quantize_activation_kernel` — FP16 `(M,K)` → INT8 `(M,K)` + scales `(M,)`. One block per row. Single pass with the row held in registers (16-byte loads; evict-first when the input exceeds L2) when `K % 8 == 0` and `K <= 8192`, otherwise two-pass: parallel max reduction → quantize.
 
 ### Dequantize (`quant/dequantize`)
 `fused_dequantize_bias_kernel` — INT32 `(M,N)` → FP16 `(M,N)` with act_scale, w_scale, bias. One block per row.

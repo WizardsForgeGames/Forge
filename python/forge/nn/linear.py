@@ -184,7 +184,7 @@ class _SparseInt8LinearFn(torch.autograd.Function):
                 scratch_x_int8, scratch_x_scale):
         output = _C.sparse_int8_linear(
             x, W_comp, w_meta, w_scale, bias,
-            scratch_x_int8, scratch_x_scale, None, 1)
+            scratch_x_int8, scratch_x_scale, None, 0)  # 0: auto tile + split-K
         ctx.save_for_backward(x, W_comp, w_meta, w_scale)
         ctx.has_bias = bias is not None
         return output

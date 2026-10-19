@@ -3,7 +3,10 @@
 //
 // Tests the full sparse INT8 GEMM pipeline:
 //   prune_compress_24 -> pack_metadata -> sparse_int8_gemm
-// Compares against a CPU reference that performs the same operations.
+// at several shapes (ragged M, N_out not a multiple of the tile, K from one 64-deep step to
+// 64 steps), for every tile config x split-K factor the dispatcher can run (forced), plus
+// the automatic plan with and without a split-K workspace. The reference is an FP64 GEMM
+// of the CPU-pruned dense weights (2:4, two largest magnitudes kept per group of 4).
 #include <forge/gemm/int8_sparse.cuh>
 #include <forge/sparsity/prune_compress.cuh>
 #include <forge/sparsity/pack_metadata.cuh>
@@ -14,134 +17,138 @@
 
 using namespace forge;
 
-// CPU sparse GEMM reference:
-// Given compressed weight (N, K/2), metadata (N*K/4), and dense activation (M, K),
-// compute output(M, N) = sum_k W_unpruned(n,k) * x(m,k) scaled and biased.
-// We reconstruct the dot product using the compressed format.
-void sparse_gemm_cpu(const int8_t* w_comp, const uint8_t* w_meta_raw,
-                     const int8_t* x, const float* act_scale,
-                     const float* w_scale, const float* bias,
-                     float* output, int M, int K, int N) {
-    int groups_per_row = K / 4;
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            int32_t acc = 0;
-            for (int g = 0; g < groups_per_row; g++) {
-                uint8_t nib = w_meta_raw[n * groups_per_row + g];
-                int k0 = nib & 3, k1 = (nib >> 2) & 3;
-                int k_base = g * 4;
-                int comp_base = n * (K / 2) + g * 2;
-                acc += (int32_t)w_comp[comp_base]     * (int32_t)x[m * K + k_base + k0];
-                acc += (int32_t)w_comp[comp_base + 1] * (int32_t)x[m * K + k_base + k1];
-            }
-            float val = (float)acc * act_scale[m] * w_scale[n];
-            if (bias) val += bias[n];
-            output[m * N + n] = val;
-        }
-    }
-}
-
-int main() {
-    std::printf("=== Test: INT8 Sparse GEMM ===\n");
-    // Use dimensions compatible with kernel requirements: K%64==0, N%16==0
-    const int M = 32, K = 128, N = 64;
-
-    // Generate random INT8 weight and activation
-    std::vector<int8_t> h_weight(N * K), h_x(M * K);
-    test::fill_random_int8(h_weight, 42);
-    test::fill_random_int8(h_x, 43);
-
-    // CPU: prune + compress
-    std::vector<int8_t> h_comp(N * K / 2);
-    std::vector<uint8_t> h_meta_raw(N * K / 4);
-    // Reuse the same pruning logic
+// 2:4 prune on the CPU: zero the two smallest-magnitude values of every group of 4
+// (same tie-breaking as prune_compress_kernel).
+static std::vector<int8_t> prune_24_dense(const std::vector<int8_t>& w, int N, int K) {
+    std::vector<int8_t> p(w.size(), 0);
     for (int row = 0; row < N; row++) {
         for (int g = 0; g < K / 4; g++) {
-            int base = row * K + g * 4;
-            int8_t vals[4] = {h_weight[base], h_weight[base+1],
-                              h_weight[base+2], h_weight[base+3]};
+            const int base = row * K + g * 4;
             int abs_v[4];
-            for (int i = 0; i < 4; i++) abs_v[i] = std::abs((int)vals[i]);
+            for (int i = 0; i < 4; i++) abs_v[i] = std::abs((int)w[base + i]);
             int min1 = 0, min2 = 1;
             if (abs_v[0] > abs_v[1]) { min1 = 1; min2 = 0; }
             for (int i = 2; i < 4; i++) {
                 if (abs_v[i] < abs_v[min1]) { min2 = min1; min1 = i; }
                 else if (abs_v[i] < abs_v[min2]) { min2 = i; }
             }
-            int keep[2], ki = 0;
             for (int i = 0; i < 4; i++)
-                if (i != min1 && i != min2) keep[ki++] = i;
-            h_comp[row * (K/2) + g * 2]     = vals[keep[0]];
-            h_comp[row * (K/2) + g * 2 + 1] = vals[keep[1]];
-            h_meta_raw[row * (K/4) + g] = (uint8_t)(keep[0] | (keep[1] << 2));
+                if (i != min1 && i != min2) p[base + i] = w[base + i];
         }
     }
+    return p;
+}
 
-    // Scales and bias
+struct Shape { int M, K, N; };
+
+static int run_shape(const Shape& sh, uint64_t seed) {
+    const int M = sh.M, K = sh.K, N = sh.N;
+    std::printf("  shape M=%d K=%d N=%d\n", M, K, N);
+
+    std::vector<int8_t> h_weight((size_t)N * K), h_x((size_t)M * K);
+    test::fill_random_int8(h_weight, seed);
+    test::fill_random_int8(h_x, seed + 1);
     std::vector<float> h_act_scale(M), h_w_scale_f(N), h_bias_f(N);
-    test::fill_random(h_act_scale, 0.001f, 0.05f, 44);
-    test::fill_random(h_w_scale_f, 0.001f, 0.05f, 45);
-    test::fill_random(h_bias_f, -0.5f, 0.5f, 46);
-
-    // CPU reference
-    std::vector<float> ref_output(M * N);
-    sparse_gemm_cpu(h_comp.data(), h_meta_raw.data(), h_x.data(),
-                    h_act_scale.data(), h_w_scale_f.data(), h_bias_f.data(),
-                    ref_output.data(), M, K, N);
-
-    // GPU pipeline: prune -> pack -> gemm
-    int8_t* d_weight = test::to_device(h_weight);
-    int8_t* d_comp = test::to_device_zeroed<int8_t>(N * K / 2);
-    uint8_t* d_meta_raw = test::to_device_zeroed<uint8_t>(N * K / 4);
-    uint32_t* d_meta_packed = test::to_device_zeroed<uint32_t>(N * K / 32);
-
-    sparsity::prune_compress_24(d_weight, d_comp, d_meta_raw, N, K);
-    sparsity::pack_metadata(d_meta_raw, d_meta_packed, N, K);
-    cudaDeviceSynchronize();
-
-    int8_t* d_x = test::to_device(h_x);
-    float* d_act_scale = test::to_device(h_act_scale);
+    test::fill_random(h_act_scale, 0.001f, 0.05f, seed + 2);
+    test::fill_random(h_w_scale_f, 0.001f, 0.05f, seed + 3);
+    test::fill_random(h_bias_f, -0.5f, 0.5f, seed + 4);
     std::vector<__half> h_w_scale(N), h_bias(N);
     for (int i = 0; i < N; i++) {
         h_w_scale[i] = __float2half(h_w_scale_f[i]);
-        h_bias[i] = __float2half(h_bias_f[i]);
+        h_bias[i]    = __float2half(h_bias_f[i]);
     }
-    __half* d_w_scale;
-    cudaMalloc(&d_w_scale, N * sizeof(__half));
-    cudaMemcpy(d_w_scale, h_w_scale.data(), N * sizeof(__half), cudaMemcpyHostToDevice);
-    __half* d_bias;
-    cudaMalloc(&d_bias, N * sizeof(__half));
-    cudaMemcpy(d_bias, h_bias.data(), N * sizeof(__half), cudaMemcpyHostToDevice);
-    __half* d_output;
-    cudaMalloc(&d_output, M * N * sizeof(__half));
 
-    gemm::sparse_int8_gemm(d_comp, d_x, d_meta_packed, d_act_scale,
-                           d_w_scale, d_bias, d_output, M, K, N,
-                           nullptr, 1);
-    cudaDeviceSynchronize();
-
-    // Read back and compare
-    std::vector<__half> gpu_output_h(M * N);
-    cudaMemcpy(gpu_output_h.data(), d_output, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
-
-    float max_diff = 0.0f;
-    float mean_rel = 0.0f;
-    int fails = 0;
-    for (int i = 0; i < M * N; i++) {
-        float gpu_val = __half2float(gpu_output_h[i]);
-        float diff = std::abs(gpu_val - ref_output[i]);
-        float rel = diff / (std::abs(ref_output[i]) + 1e-4f);
-        if (diff > max_diff) max_diff = diff;
-        mean_rel += rel;
-        if (rel > 0.1f && diff > 0.5f) fails++;
+    // FP64 reference of the pruned dense weights, without and with bias
+    const std::vector<int8_t> w_pruned = prune_24_dense(h_weight, N, K);
+    std::vector<double> ref_nb((size_t)M * N), ref_b((size_t)M * N);
+    double ref_rms = 0.0;
+    for (int m = 0; m < M; m++) {
+        const int8_t* xr = &h_x[(size_t)m * K];
+        for (int n = 0; n < N; n++) {
+            const int8_t* wr = &w_pruned[(size_t)n * K];
+            long long acc = 0;
+            for (int k = 0; k < K; k++) acc += (int)wr[k] * (int)xr[k];
+            const double v = (double)acc * h_act_scale[m] * (double)__half2float(h_w_scale[n]);
+            ref_nb[(size_t)m * N + n] = v;
+            ref_b[(size_t)m * N + n]  = v + (double)__half2float(h_bias[n]);
+            ref_rms += v * v;
+        }
     }
-    mean_rel /= (M * N);
+    ref_rms = std::sqrt(ref_rms / ((double)M * N));
 
-    std::printf("  max_diff=%.4f mean_rel=%.4f fails=%d/%d\n",
-                max_diff, mean_rel, fails, M * N);
-    FORGE_ASSERT(fails == 0, "sparse GEMM output mismatch");
-    FORGE_ASSERT(mean_rel < 0.05f, "sparse GEMM mean relative error too high");
-    std::printf("  PASS [sparse_int8_gemm]\n");
+    // GPU weight preparation
+    int8_t*   d_weight = test::to_device(h_weight);
+    int8_t*   d_comp   = test::to_device_zeroed<int8_t>((size_t)N * K / 2);
+    uint8_t*  d_meta_raw    = test::to_device_zeroed<uint8_t>((size_t)N * K / 4);
+    uint32_t* d_meta_packed = test::to_device_zeroed<uint32_t>((size_t)N * K / 32);
+    sparsity::prune_compress_24(d_weight, d_comp, d_meta_raw, N, K);
+    sparsity::pack_metadata(d_meta_raw, d_meta_packed, N, K);
+    FORGE_CHECK(cudaDeviceSynchronize());
+
+    int8_t* d_x         = test::to_device(h_x);
+    float*  d_act_scale = test::to_device(h_act_scale);
+    __half* d_w_scale   = test::to_device(h_w_scale);
+    __half* d_bias      = test::to_device(h_bias);
+    __half* d_output    = test::to_device_zeroed<__half>((size_t)M * N);
+    float*  d_ws        = test::to_device_zeroed<float>((size_t)M * N);
+
+    int failures = 0;
+    auto check = [&](const char* label, int tile, int split, bool use_ws, bool use_bias) {
+        // Garbage in the output and the workspace: the call must overwrite / zero them.
+        FORGE_CHECK(cudaMemset(d_output, 0x7B, (size_t)M * N * sizeof(__half)));
+        FORGE_CHECK(cudaMemset(d_ws, 0x5A, (size_t)M * N * sizeof(float)));
+        gemm::sparse_int8_gemm(d_comp, d_x, d_meta_packed, d_act_scale, d_w_scale,
+                               use_bias ? d_bias : nullptr, d_output, M, K, N,
+                               use_ws ? d_ws : nullptr, split, nullptr, tile);
+        FORGE_CHECK(cudaGetLastError());
+        FORGE_CHECK(cudaDeviceSynchronize());
+        const gemm::SparseGemmPlan plan = gemm::sparse_int8_gemm_plan(M, K, N, split, use_ws, tile);
+
+        const auto out = test::to_host(d_output, (size_t)M * N);
+        const std::vector<double>& ref = use_bias ? ref_b : ref_nb;
+        double max_err = 0.0;
+        int bad = 0;
+        for (size_t i = 0; i < out.size(); i++) {
+            const double g = (double)__half2float(out[i]);
+            const double err = std::abs(g - ref[i]);
+            // fp16 output rounding (2^-11 relative) plus fp32 dequant / atomics slack
+            const double tol = 2e-3 * std::abs(ref[i]) + 1e-3 * ref_rms + 1e-4;
+            if (!(err <= tol)) bad++;   // NaN counts as bad
+            max_err = std::max(max_err, std::isfinite(err) ? err : 1e30);
+        }
+        const bool ok = (bad == 0);
+        std::printf("    %-14s tile=%d split=%-2d ws=%d bias=%d -> plan(tile=%d, split=%d) "
+                    "max_err=%.3e (rms %.3e) %s\n",
+                    label, tile, split, use_ws ? 1 : 0, use_bias ? 1 : 0, plan.tile,
+                    plan.split_k, max_err, ref_rms, ok ? "ok" : "FAIL");
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: %d/%zu outputs out of tolerance\n", bad, out.size());
+            failures++;
+        }
+        // Forced configs must run what was asked for.
+        if (tile >= 0 && plan.tile != tile) { std::fprintf(stderr, "FAIL: tile not honored\n"); failures++; }
+        if (split >= 1 && use_ws && plan.split_k != split) {
+            std::fprintf(stderr, "FAIL: split not honored\n"); failures++;
+        }
+        if (!use_ws && plan.split_k != 1) { std::fprintf(stderr, "FAIL: split without workspace\n"); failures++; }
+    };
+
+    // Every tile x every split-K factor the cost model can pick (1, 2, 3, 4, 6), plus an
+    // uneven split outside the candidate list (7) and one larger than the K-step count.
+    const int k_iters = K / 64;
+    for (int tile = 0; tile < gemm::kSparseNumTiles; tile++) {
+        for (int split : {1, 2, 3, 4, 6, 7}) {
+            check("forced", tile, split, true, (split % 2) == 1);
+        }
+        check("split>ksteps", tile, k_iters + 1, true, true);
+    }
+    // Automatic dispatch: with a workspace (tile + split chosen), without one (split 1),
+    // default split_k = 1, and a requested split that is dropped for lack of a workspace.
+    check("auto", gemm::kSparseTileAuto, 0, true, true);
+    check("auto no-bias", gemm::kSparseTileAuto, 0, true, false);
+    check("auto no-ws", gemm::kSparseTileAuto, 0, false, true);
+    check("default split", gemm::kSparseTileAuto, 1, false, true);
+    check("split no-ws", gemm::kSparseTileAuto, 4, false, true);
 
     test::free_device(d_weight);
     test::free_device(d_comp);
@@ -149,9 +156,46 @@ int main() {
     test::free_device(d_meta_packed);
     test::free_device(d_x);
     test::free_device(d_act_scale);
-    cudaFree(d_w_scale);
-    cudaFree(d_bias);
-    cudaFree(d_output);
+    test::free_device(d_w_scale);
+    test::free_device(d_bias);
+    test::free_device(d_output);
+    test::free_device(d_ws);
+    return failures;
+}
+
+int main() {
+    std::printf("=== Test: INT8 Sparse GEMM ===\n");
+    // Kernel requirements: K % 64 == 0, N % 16 == 0. M is unconstrained.
+    const Shape shapes[] = {
+        {   1,   64,   16},   // single K step, single row/token
+        {  32,  128,   64},   // original test shape
+        {  37,  192,  208},   // 3 K steps (partial metadata chunk), ragged M and N
+        { 100,  640,  272},   // 10 K steps: uneven split ranges cross metadata chunks
+        { 300, 1280,  384},
+        {1000, 1536,  512},
+        {2050,  512,  400},   // M past several 128-token tiles, ragged
+        { 129, 4096,   96},   // deep K, narrow N
+    };
+    int failures = 0;
+    uint64_t seed = 42;
+    for (const Shape& s : shapes) {
+        failures += run_shape(s, seed);
+        seed += 10;
+    }
+
+    // The dispatcher's choices at representative shapes (RTX 4090 cost model).
+    std::printf("  auto plans (with workspace):\n");
+    const Shape plans[] = {{64, 1536, 6144}, {64, 5120, 1280}, {1024, 1536, 6144},
+                           {1024, 6144, 1536}, {4096, 1536, 6144}, {8192, 5120, 1280},
+                           {512, 1280, 768}, {256, 4096, 14336}};
+    for (const Shape& s : plans) {
+        const gemm::SparseGemmPlan p = gemm::sparse_int8_gemm_plan(s.M, s.K, s.N, 0, true);
+        std::printf("    M=%-5d K=%-5d N=%-6d -> tile=%d split=%d\n", s.M, s.K, s.N, p.tile, p.split_k);
+        FORGE_ASSERT(p.tile >= 0 && p.tile < gemm::kSparseNumTiles && p.split_k >= 1, "invalid plan");
+    }
+
+    FORGE_ASSERT(failures == 0, "sparse GEMM output mismatch");
+    std::printf("  PASS [sparse_int8_gemm]\n");
     std::printf("ALL PASSED\n");
     return 0;
 }

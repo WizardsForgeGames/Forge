@@ -527,6 +527,16 @@ torch::Tensor sparse_int8_linear_binding(
     int M = x.size(0), K = x.size(1), N_out = W_comp.size(0);
     auto output = torch::empty({M, N_out}, x.options());
 
+    // split_k <= 0 (auto) without a caller workspace: allocate one when the cost model
+    // picks split-K (the launcher zeroes it).
+    torch::Tensor ws_alloc;
+    float* ws_ptr = splitk_workspace.has_value() ? splitk_workspace->data_ptr<float>() : nullptr;
+    if (ws_ptr == nullptr && split_k <= 0 &&
+        forge::gemm::sparse_int8_gemm_plan(M, K, N_out, split_k, true).split_k > 1) {
+        ws_alloc = torch::empty({M, N_out}, x.options().dtype(torch::kFloat32));
+        ws_ptr = ws_alloc.data_ptr<float>();
+    }
+
     forge::gemm::sparse_int8_linear(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         W_comp.data_ptr<int8_t>(),
@@ -538,8 +548,7 @@ torch::Tensor sparse_int8_linear_binding(
         M, K, N_out,
         scratch_x_int8.data_ptr<int8_t>(),
         scratch_x_scale.data_ptr<float>(),
-        splitk_workspace.has_value() ? splitk_workspace->data_ptr<float>() : nullptr,
-        split_k, current_stream());
+        ws_ptr, split_k, current_stream());
 
     return output;
 }

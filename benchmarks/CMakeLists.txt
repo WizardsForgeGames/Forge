@@ -6,4 +6,5 @@ function(forge_add_bench BENCH_NAME BENCH_SOURCE)
     )
 endfunction()
 
-# No benchmarks are published yet; add them with forge_add_bench(<name> <source>).
+# Add benchmarks with forge_add_bench(<name> <source>).
+forge_add_bench(bench_int8_sparse bench_int8_sparse.cu)

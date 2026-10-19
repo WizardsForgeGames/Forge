@@ -30,6 +30,18 @@ __device__ __forceinline__ void cp_async_16_stream(void* dst_smem, const void* s
     );
 }
 
+// Shared-address (u32) forms: the destination is already a shared-window address, so
+// per-tile precomputed offsets can be used without a generic->shared conversion per copy.
+__device__ __forceinline__ void cp_async_16_u32(uint32_t dst_smem, const void* src_gmem) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(dst_smem), "l"(src_gmem));
+}
+__device__ __forceinline__ void cp_async_16_stream_u32(uint32_t dst_smem, const void* src_gmem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_smem), "l"(src_gmem));
+}
+__device__ __forceinline__ void cp_async_8_u32(uint32_t dst_smem, const void* src_gmem) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(dst_smem), "l"(src_gmem));
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
