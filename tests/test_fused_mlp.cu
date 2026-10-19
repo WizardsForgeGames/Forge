@@ -571,6 +571,8 @@ int main() {
             {"tf32_atomic",        9,  2,  64, 5,  600, A::CELU,    true,  false, false, 0.0f},
             {"tf32_h128",          9,  2, 128, 3, 4100, A::ReLU,    true,  false, false, 1.0f},
             {"tf32_h48",           7,  3,  48, 4,  777, A::Sigmoid, true,  false, false, 0.0f},
+            {"tf32_in17",         17,  4,  32, 6, 5001, A::SiLU,    true,  false, false, 0.0f},
+            {"tf32_in_gt_h",     130,  2,  64, 2,  300, A::GELU,    true,  false, false, 1.0f},
         };
         bool all_ok = true;
         uint64_t seed = 1000;

@@ -105,6 +105,14 @@ constexpr int BWD_BLOCK = 256;  // backward kernel block size (8 warps)
 // For H>128, TILE_B is forced to <=2, so ceil(2*256/256)=2 — well within limit.
 constexpr int MAX_REGS = 16;
 
+// Shared-memory row stride (floats) of the TF32 backward kernel: max(hidden,
+// n_inputs) rounded up to the 16-wide wmma N tile used for gradient
+// propagation. Shared by the kernel and the host smem-size computation.
+__host__ __device__ __forceinline__ int tc_bwd_k_max(int hidden, int n_inputs) {
+    int k = (n_inputs > hidden) ? n_inputs : hidden;
+    return (k + 15) & ~15;
+}
+
 // Read-only weight access: __ldg() for L2 mode, direct for shared memory mode.
 // __ldg() routes through the read-only texture cache with better eviction behavior
 // for data that is read by many threads but never written during the kernel.
@@ -966,9 +974,9 @@ fused_mlp_backward_tc_kernel(
 
     extern __shared__ char smem_raw[];
 
-    int k_max = hidden;
-    if (n_inputs > hidden) k_max = n_inputs;
-    k_max = (k_max + 7) & ~7;  // round up to multiple of 8
+    // Gradient propagation writes 16-wide N tiles over in_dim (n_inputs at
+    // layer 0), so strides are padded to a multiple of 16, not 8.
+    const int k_max = tc_bwd_k_max(hidden, n_inputs);
 
     int w_stride = k_max;
     int a_stride = k_max;
@@ -1093,18 +1101,18 @@ fused_mlp_backward_tc_kernel(
         }
         __syncthreads();
 
-        // Copy propagated gradients to s_dact for hidden layer processing
+        // Copy propagated gradients to s_dact for hidden layer processing.
+        // Both buffers are [TILE_B, a_stride]; a_stride exceeds hidden when
+        // n_inputs > hidden, so index by (s, d) -- a flat copy of
+        // n_active*hidden elements would misplace every row after the first.
+        // Zero the padding columns and the inactive rows (s_prop rows past
+        // n_active are not written this tile) in the same pass.
         {
-            int total = n_active * hidden;
-            for (int i = tid; i < total; i += blockDim.x)
-                s_dact[i] = s_prop[i];
-            // Zero padding beyond hidden dim
             int total_buf = TILE_B * a_stride;
             for (int i = tid; i < total_buf; i += blockDim.x) {
                 int s = i / a_stride;
                 int d = i % a_stride;
-                if (d >= hidden)
-                    s_dact[i] = 0.0f;
+                s_dact[i] = (s < n_active && d < hidden) ? s_prop[i] : 0.0f;
             }
         }
         __syncthreads();
@@ -1117,7 +1125,10 @@ fused_mlp_backward_tc_kernel(
 
     for (int l = n_layers - 1; l >= 0; l--) {
         int in_dim = (l == 0) ? n_inputs : hidden;
-        int in_dim_padded = (in_dim + WK - 1) & ~(WK - 1);  // round up to 8
+        // N dimension of the propagation GEMM: round up to the 16-wide tile
+        // (<= k_max). Rounding to 8 dropped the last 8 columns of d_input
+        // whenever n_inputs % 16 was in 1..8.
+        int in_dim_padded = (in_dim + WN - 1) & ~(WN - 1);
         w_offset_track -= hidden * in_dim + hidden;
 
         const float* W_ptr = weights + w_offset_track;
@@ -1206,7 +1217,6 @@ fused_mlp_backward_tc_kernel(
 
             int tiles_m = TILE_B / WM;
             int tiles_n_prop = in_dim_padded / WN;
-            if (tiles_n_prop == 0) tiles_n_prop = 1;  // safety for very small in_dim
             int k_steps_prop = hidden / WK;  // hidden is always multiple of 16
             int total_tiles_prop = tiles_m * tiles_n_prop;
 
@@ -1588,9 +1598,7 @@ void fused_mlp_backward(
             cudaMemsetAsync(d_weights, 0, n_w * sizeof(float), stream);
         }
 
-        int k_max = desc.hidden;
-        if (desc.n_inputs > desc.hidden) k_max = desc.n_inputs;
-        k_max = (k_max + 7) & ~7;
+        int k_max = tc_bwd_k_max(desc.hidden, desc.n_inputs);
 
         int w_stride = k_max;
         int a_stride = k_max;
